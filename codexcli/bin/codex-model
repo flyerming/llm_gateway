@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Switch the Codex model by picking from the private gateway's live model list.
+# Written by codexcli/private_api.py; safe to delete.
+exec "D:\ProgramData\miniconda3\python.exe" "E:\推理加速-2026\新技术\litellm-0914-deploy\codexcli\private_api.py" --switch-model "$@"

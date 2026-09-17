@@ -1,0 +1,92 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+# 容器化部署下 mihomo 跑在 proxy 容器里，控制接口必须监听 0.0.0.0 才能被同网络的
+# proxy-console 容器访问（容器之间走 compose 网络，127.0.0.1 在各自的网络命名空间里
+# 是不通的）。安全性靠 compose 不发布这个端口保证：9090 永远出不了 compose 网络，
+# 局域网唯一能碰到的是 proxy-console 的 8787，那里有 Basic 鉴权。
+external-controller: '0.0.0.0:9090'
+dns:
+    enable: true
+    ipv6: true
+    default-nameserver: ['https://223.5.5.5/dns-query', 'https://223.6.6.6/dns-query']
+    enhanced-mode: fake-ip
+    fake-ip-range: 198.18.0.1/16
+    use-hosts: true
+    respect-rules: true
+    direct-nameserver: ['https://223.6.6.6/dns-query', 'https://223.5.5.5/dns-query']
+    proxy-server-nameserver: ['https://v.recipes/dns/dns.google/dns-query#ecs=1.1.1.1&ecs-override=true', 'https://1.1.1.1/dns-query#ecs=1.1.1.1&ecs-override=true', 'https://8.8.8.8/dns-query#ecs=1.1.1.1&ecs-override=true', 'https://doh.applied-privacy.net/query#ecs=1.1.1.1&ecs-override=true', 'https://jp.tiarap.org/dns-query#ecs=1.1.1.1&ecs-override=true', 'https://doh.pub/dns-query']
+    nameserver: ['https://223.5.5.5/dns-query', 'https://223.6.6.6/dns-query']
+    fallback: ['https://v.recipes/dns/dns.google/dns-query', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query', 'https://doh.applied-privacy.net/query']
+    fallback-filter: { geoip: true, geoip-code: CN, geosite: [gfw], ipcidr: [240.0.0.0/4], domain: [+.google.com, +.facebook.com, +.youtube.com] }
+# Nodes come from the subscription, not from an inline `proxies:` block, so the
+# server always sees the same node list as the desktop client. mihomo refreshes
+# the payload on start and every `interval` seconds, and caches it in `path`.
+proxy-providers:
+    subscription:
+        type: http
+        url: 'https://link.ssrsub.de/csgo/bb8f9ca0b5c313ade20ea71bc432c0ba'
+        path: ./providers/subscription.yaml
+        interval: 86400
+        health-check: { enable: true, url: 'http://cp.cloudflare.com/generate_204', interval: 300 }
+proxy-groups:
+    - { name: '🚀 节点选择', type: select, proxies: ['♻️ 自动选择', DIRECT], use: [subscription] }
+    - { name: '♻️ 自动选择', type: url-test, url: 'http://cp.cloudflare.com/generate_204', interval: 300, tolerance: 50, use: [subscription] }
+    - { name: '🌍 国外媒体', type: select, proxies: ['🚀 节点选择', '♻️ 自动选择', '🎯 全球直连'], use: [subscription] }
+    - { name: '📲 电报信息', type: select, proxies: ['🚀 节点选择', '🎯 全球直连'], use: [subscription] }
+    - { name: 'Ⓜ️ 微软服务', type: select, proxies: ['🎯 全球直连', '🚀 节点选择'], use: [subscription] }
+    - { name: '🍎 苹果服务', type: select, proxies: ['🚀 节点选择', '🎯 全球直连'], use: [subscription] }
+    - { name: '📢 谷歌FCM', type: select, proxies: ['🚀 节点选择', '🎯 全球直连', '♻️ 自动选择'], use: [subscription] }
+    - { name: '🎯 全球直连', type: select, proxies: [DIRECT, '🚀 节点选择', '♻️ 自动选择'] }
+    - { name: '🛑 全球拦截', type: select, proxies: [REJECT, DIRECT] }
+    - { name: '🍃 应用净化', type: select, proxies: [REJECT, DIRECT] }
+    - { name: '🐟 漏网之鱼', type: select, proxies: ['🚀 节点选择', '🎯 全球直连', '♻️ 自动选择'], use: [subscription] }
+rule-providers:
+    # 例外清单：控制台（8787 网页）读写这两个本地文件，不走订阅。
+    # 它们是「不走代理的域名」唯一的落地位置 —— CLIProxyAPI 的 proxy-url 是全局的，
+    # 没有按域名绕过的开关，所以内网域名、必须直连的域名只能在这里放行。
+    # 文件必须存在，否则 mihomo 启动时会报错；空文件（只有注释）是合法的。
+    CustomDirect: { behavior: classical, format: text, path: ./ruleset/CustomDirect.list, type: file }
+    CustomProxy: { behavior: classical, format: text, path: ./ruleset/CustomProxy.list, type: file }
+    LocalAreaNetwork: { behavior: classical, format: text, interval: 3600, path: ./ruleset/LocalAreaNetwork.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/LocalAreaNetwork.list' }
+    UnBan: { behavior: classical, format: text, interval: 3600, path: ./ruleset/UnBan.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/UnBan.list' }
+    BanAD: { behavior: classical, format: text, interval: 3600, path: ./ruleset/BanAD.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/BanAD.list' }
+    BanProgramAD: { behavior: classical, format: text, interval: 3600, path: ./ruleset/BanProgramAD.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/BanProgramAD.list' }
+    GoogleFCM: { behavior: classical, format: text, interval: 3600, path: ./ruleset/GoogleFCM.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Ruleset/GoogleFCM.list' }
+    GoogleCN: { behavior: classical, format: text, interval: 3600, path: ./ruleset/GoogleCN.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/GoogleCN.list' }
+    SteamCN: { behavior: classical, format: text, interval: 3600, path: ./ruleset/SteamCN.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Ruleset/SteamCN.list' }
+    Microsoft: { behavior: classical, format: text, interval: 3600, path: ./ruleset/Microsoft.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Microsoft.list' }
+    Apple: { behavior: classical, format: text, interval: 3600, path: ./ruleset/Apple.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Apple.list' }
+    Telegram: { behavior: classical, format: text, interval: 3600, path: ./ruleset/Telegram.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Telegram.list' }
+    ProxyMedia: { behavior: classical, format: text, interval: 3600, path: ./ruleset/ProxyMedia.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ProxyMedia.list' }
+    ProxyLite: { behavior: classical, format: text, interval: 3600, path: ./ruleset/ProxyLite.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ProxyLite.list' }
+    ChinaDomain: { behavior: classical, format: text, interval: 3600, path: ./ruleset/ChinaDomain.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list' }
+    ChinaCompanyIp: { behavior: classical, format: text, interval: 3600, path: ./ruleset/ChinaCompanyIp.list, type: http, url: 'https://testingcf.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaCompanyIp.list' }
+rules:
+    # 例外清单必须放在最前面：mihomo 是首个匹配的规则生效，放到后面会被
+    # ProxyLite / ChinaDomain / GEOSITE,CN / MATCH 抢先命中而没有效果。
+    # CustomDirect 走 DIRECT（真实 IP 直出）；CustomProxy 即使命中后面的
+    # ChinaDomain / GEOIP,CN 也强制从节点走。
+    - 'RULE-SET,CustomDirect,DIRECT'
+    - 'RULE-SET,CustomProxy,🚀 节点选择'
+    - 'DOMAIN,sub.ssrsub.de,DIRECT'
+    - 'DOMAIN,link.ssrsub.de,DIRECT'
+    - 'RULE-SET,LocalAreaNetwork,🎯 全球直连'
+    - 'RULE-SET,UnBan,🎯 全球直连'
+    - 'RULE-SET,BanAD,🛑 全球拦截'
+    - 'RULE-SET,BanProgramAD,🍃 应用净化'
+    - 'RULE-SET,GoogleFCM,📢 谷歌FCM'
+    - 'RULE-SET,GoogleCN,🎯 全球直连'
+    - 'RULE-SET,SteamCN,🎯 全球直连'
+    - 'RULE-SET,Microsoft,Ⓜ️ 微软服务'
+    - 'RULE-SET,Apple,🍎 苹果服务'
+    - 'RULE-SET,Telegram,📲 电报信息'
+    - 'RULE-SET,ProxyMedia,🌍 国外媒体'
+    - 'RULE-SET,ProxyLite,🚀 节点选择'
+    - 'RULE-SET,ChinaDomain,🎯 全球直连'
+    - 'RULE-SET,ChinaCompanyIp,🎯 全球直连'
+    - 'GEOSITE,CN,🎯 全球直连'
+    - 'GEOIP,CN,🎯 全球直连'
+    - 'MATCH,🐟 漏网之鱼'

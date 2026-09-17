@@ -1,0 +1,30 @@
+# CLIProxyAPI runtime configuration.
+# The entrypoint replaces __CLIPROXY_API_KEY__ from .env at container start.
+
+host: "0.0.0.0"
+port: 8317
+
+# OAuth credential files are persisted by the compose named volume mounted at
+# /root/.cli-proxy-api. Keep the upstream default path so CLIProxyAPI can find it.
+auth-dir: "~/.cli-proxy-api"
+
+# LiteLLM is the only data-plane client in this compose project. The key is
+# rendered from CLIPROXY_API_KEY and is never exposed as a host port.
+api-keys:
+  - "__CLIPROXY_API_KEY__"
+
+# All upstream Codex/OpenAI traffic from CLIProxyAPI goes through mihomo.
+proxy-url: "http://proxy:7890"
+request-retry: 3
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+# The node console calls Management API over the private compose network.
+# MANAGEMENT_PASSWORD is supplied as an environment variable by Compose;
+# CLIProxyAPI uses it as the remote management secret.
+remote-management:
+  allow-remote: true
+  secret-key: ""
+  disable-control-panel: true

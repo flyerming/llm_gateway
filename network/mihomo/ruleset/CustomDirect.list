@@ -1,0 +1,17 @@
+# 直连例外：命中这里的域名/IP 一律 DIRECT（真实 IP 直出），不经过任何节点。
+#
+# 由控制台（http://<服务器IP>:8787 的「代理例外」面板）读写，也可以手工编辑：
+#   - 一行一条，格式：匹配方式,值[,no-resolve]
+#   - 支持 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / IP-CIDR / IP-CIDR6 / GEOIP
+#   - 以 # 开头的是注释，空行会被忽略
+#   - 手工改完需要让 mihomo 重新读取：控制台点「重新应用」，或
+#     docker compose restart proxy
+#
+# 注意：这个文件里的域名让 mihomo 解析到真实 IP 再去连。如果域名只在某个容器
+# 的 extra_hosts / /etc/hosts 里有解析（比如指向宿主机的内网域名），把请求交给
+# mihomo 反而会解析失败 —— 那种情况需要同时把域名加进容器的 NO_PROXY，
+# 让容器自己直连。控制台面板底部会生成可以粘贴的 NO_PROXY 值。
+
+# 内网域名：绝不允许走到境外节点上。同名域名在 compose 里通过 extra_hosts
+# 指向宿主机，litellm 的 NO_PROXY 已经包含它，这里的规则是第二道保险。
+DOMAIN-SUFFIX,aix-backup.hismarttv.com

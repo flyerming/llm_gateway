@@ -1,0 +1,154 @@
+# LiteLLM 网关 + CLIProxyAPI + Postgres + mihomo 代理 + 节点可视化控制台
+#
+# 所有服务都在同一个 compose 网络里，互相用服务名访问：
+#   CLIProxyAPI --proxy-url--> proxy:7890       (Codex/OpenAI OAuth 上游)
+#   litellm     --API-------> cli-proxy-api:8317 (OpenAI 兼容接口)
+#   console     --mihomo---> proxy:9090        (查节点、切换、刷新订阅)
+#   console     --CLIProxy-> cli-proxy-api:8317 (统一登录和账号状态)
+#   console     --文件-----> network/mihomo/ruleset (代理例外清单，网页可改)
+#   litellm     --DATABASE-> db:5432
+#
+# 对外只发布 8787（节点/登录控制台）和 4000（LiteLLM）。
+# 7890、8317、9090 只在 compose 网络内可见。
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # mihomo 数据面：真正转发 CLIProxyAPI 的 OAuth/API 流量。
+  proxy:
+    image: alpine:3.20
+    restart: unless-stopped
+    volumes:
+      - ./network:/app
+      # Alpine 需要宿主机 CA；RHEL/CentOS 系主机可改为 /etc/pki:/etc/pki:ro。
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    command:
+      - sh
+      - -c
+      - |
+        chmod +x /app/mihomo-linux-amd64 2>/dev/null || true
+        exec /app/mihomo-linux-amd64 -d /app/mihomo
+    healthcheck:
+      # 某些 Alpine/busybox 版本的 wget 参数不同；若持续 unhealthy，可按 README 删除本段。
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:9090/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+
+  # CLIProxyAPI 控制面/数据面：把 ChatGPT/Codex OAuth 订阅包装成 OpenAI 兼容 API。
+  # 通过 proxy-url=http://proxy:7890 出网；认证文件持久化在 cliproxy_auths 卷。
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:v7.3.2}
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_started
+    environment:
+      CLIPROXY_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
+      # MANAGEMENT_PASSWORD 是 CLIProxyAPI 管理接口密钥，必须和控制台使用的值一致。
+      MANAGEMENT_PASSWORD: ${CLIPROXY_MANAGEMENT_KEY:?请在 .env 里设置 CLIPROXY_MANAGEMENT_KEY}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./cliproxyapi/config.yaml.template:/config/config.yaml.template:ro
+      - ./cliproxyapi/entrypoint.sh:/usr/local/bin/cliproxy-entrypoint.sh:ro
+      - cliproxy_auths:/root/.cli-proxy-api
+      - cliproxy_logs:/CLIProxyAPI/logs
+      - cliproxy_plugins:/CLIProxyAPI/plugins
+    expose:
+      - "8317"
+    command: ["/bin/sh", "/usr/local/bin/cliproxy-entrypoint.sh"]
+    logging: *default-logging
+
+  # 节点/登录网页控制台。Basic 鉴权是唯一的局域网入口。
+  proxy-console:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_started
+      cli-proxy-api:
+        condition: service_started
+    volumes:
+      - ./network:/app:ro
+      # 例外清单（CustomDirect.list / CustomProxy.list）要能被网页改写，所以单独把
+      # ruleset 目录以可写方式挂进来。控制台脚本本身仍然只读，网页改不到代码。
+      - ./network/mihomo/ruleset:/ruleset
+    environment:
+      CONSOLE_LISTEN: 0.0.0.0:8787
+      CONSOLE_USER: ${CONSOLE_USER:-admin}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:?请在 .env 里设置 CONSOLE_PASSWORD}
+      MIHOMO_CONTROLLER_URL: http://proxy:9090
+      MIHOMO_SELECTOR: "🚀 节点选择"
+      # 例外规则的写入目录，以及 mihomo 整份重载时用到的配置路径（该路径是
+      # proxy 容器里的路径，不是控制台的）。
+      RULESET_DIR: /ruleset
+      MIHOMO_CONFIG_PATH: /app/mihomo/config.yaml
+      CLIPROXY_MANAGEMENT_URL: http://cli-proxy-api:8317/v0/management
+      CLIPROXY_MANAGEMENT_KEY: ${CLIPROXY_MANAGEMENT_KEY:?请在 .env 里设置 CLIPROXY_MANAGEMENT_KEY}
+      # 数据面：只有「连通性自检」用它调 /v1/models 和 /v1/chat/completions。
+      # 和 LiteLLM 用的是同一把 key，但控制台绝不会把它或响应原文里的密钥发给浏览器。
+      CLIPROXY_BASE_URL: http://cli-proxy-api:8317/v1
+      CLIPROXY_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
+    ports:
+      - "8787:8787"
+    command: ["python", "/app/proxy-console.py"]
+    logging: *default-logging
+
+  # LiteLLM 对外提供统一 API；模型的 base_url/key 指向 cli-proxy-api（见 README）。
+  litellm:
+    image: litellm/litellm-database:v1.100.1
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?请在 .env 里设置 LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?请在 .env 里设置 LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      # LiteLLM 不走代理：
+      #   - 经过 CLIProxyAPI 的模型，LiteLLM 只是调 cli-proxy-api:8317，是容器间直连；
+      #     要不要翻墙由 CLIProxyAPI 那一跳（proxy-url + mihomo 规则）决定。
+      #   - 不经过 CLIProxyAPI 的自有 endpoint，目前没有翻墙需求。
+      # 所以这里不设 HTTP_PROXY/HTTPS_PROXY。以后某个自有 endpoint 需要走节点时，
+      # 把下面两行取消注释即可 —— NO_PROXY 里的清单已经备好了。
+      # HTTP_PROXY: http://proxy:7890
+      # HTTPS_PROXY: http://proxy:7890
+      NO_PROXY: aix-backup.hismarttv.com,localhost,127.0.0.1,db,proxy,cli-proxy-api
+    depends_on:
+      db:
+        condition: service_healthy
+      cli-proxy-api:
+        condition: service_started
+    # 以下配置在云端，与内网服务器做内网穿透的时候需要配置
+    # extra_hosts:
+    #   - "aix-backup.hismarttv.com:host-gateway"
+    # 156服务器上，通过docker compose启动需要添加如下
+    logging: *default-logging
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  cliproxy_auths:
+  cliproxy_logs:
+  cliproxy_plugins:

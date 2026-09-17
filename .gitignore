@@ -1,0 +1,15 @@
+# 密钥。里面有 LiteLLM 的 master/salt key、Postgres 密码、控制台密码。
+.env
+
+# mihomo 的运行时缓存。subscription.yaml 含有订阅链接和每个节点的 uuid，
+# cache.db 是运行状态，都不该进仓库。
+network/mihomo/providers/
+network/mihomo/cache.db
+network/mihomo/mihomo.log
+
+# 注意：network/mihomo/config.yaml 里的订阅 url 和
+# clash/RihD9ROJzl50.yaml 里的节点凭据同样是敏感信息，
+# 如果要公开这个仓库，这两个文件也要一并处理。
+
+__pycache__/
+*.pyc
