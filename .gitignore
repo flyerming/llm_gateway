@@ -7,9 +7,26 @@ network/mihomo/providers/
 network/mihomo/cache.db
 network/mihomo/mihomo.log
 
+# deepseek-harness源码编译依赖包，实际配置时自动拉取
+deepseek-harness/deepseek-harness-dsh-v0.1.5-rc.2-git/node_modules
+# 上游源码 checkout 自带独立 .git；根项目只跟踪本目录的部署封装。
+deepseek-harness/deepseek-harness-dsh-*/
+deepseek-harness/data/
+deepseek-harness/workspaces/
+
 # 注意：network/mihomo/config.yaml 里的订阅 url 和
 # clash/RihD9ROJzl50.yaml 里的节点凭据同样是敏感信息，
 # 如果要公开这个仓库，这两个文件也要一并处理。
 
 __pycache__/
 *.pyc
+
+# 模型能力配置：每个用户本地生成、之后归用户所有。
+# 它是运行期产物（首次运行由 model-config.seed.jsonc ⊕ 网关模型列表生成），
+# 所以不该进仓库——进来就会盖掉别人的手改。随包发的是 seed 那份。
+codexcli/model-config.jsonc
+vscode/model-config.jsonc
+
+# 插件安装包：单个 200-400MB，不进仓库。版本号与下载方式见 vscode/README.md。
+vscode/*.vsix
+codexcli.zip

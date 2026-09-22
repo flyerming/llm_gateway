@@ -27,20 +27,28 @@ CAPABILITY IS MEASURED, NOT DECLARED
 The gateway is no help here: `GET /v1/models` reports `mode` ("chat" vs
 "image_generation") and nothing about input types. And "accepts the request" is
 not the same as "can see" -- one model on this deployment answers HTTP 200 to an
-image and then describes a colour that is not in it. So the table below was
-measured, by sending a solid-red and a solid-blue PNG and checking the model tells
-them apart. `--probe-modalities` re-runs that measurement.
+image and then describes a colour that is not in it. So each model was measured,
+by sending a solid-red and a solid-blue PNG and checking the model tells them
+apart. `--probe-modalities` re-runs that measurement.
 
-Whichever way the measurement goes, the entry is written down explicitly -- a
-model that CANNOT see is listed as `("text",)` rather than left to the fallback, so
+Whichever way the measurement goes, the verdict is written down explicitly -- a
+model that CANNOT see is recorded as `["text"]` rather than left to the fallback, so
 that nobody later mistakes "not configured" for "not capable" and switches it on.
+
+WHERE THE VERDICTS LIVE
+-----------------------
+In data, not here: `$CODEX_HOME/model-config.jsonc` (user-editable) seeded by
+`model-config.seed.jsonc` (shipped). This module owns the MEASUREMENT -- the probe
+images, the judge, the fallback policy -- and `modelconfig.py` owns the storage.
+The split exists because keeping the verdicts in source made a gateway slug rename
+unfixable without a new release; see modelconfig.py's docstring.
 
 OPENAI'S OWN MODELS
 -------------------
 Their capability is OpenAI's to declare, so -- exactly as with reasoning levels --
-it is copied out of `models_cache.json` verbatim and the user store is ignored for
-them. Note this is not just tidiness: the catalog we write REPLACES Codex's, so an
-entry we emit for `gpt-5.6-sol` overrides what OpenAI shipped. Before this module
+it is copied out of `models_cache.json` verbatim and every config file is ignored
+for them. Note this is not just tidiness: the catalog we write REPLACES Codex's, so
+an entry we emit for `gpt-5.6-sol` overrides what OpenAI shipped. Before this module
 existed the catalog hardcoded `["text"]` for everything, which quietly took image
 input away from the OpenAI models too.
 """
@@ -53,6 +61,7 @@ import struct
 import zlib
 from pathlib import Path
 
+import modelconfig
 from detect import codex_home, codex_models_cache
 from reasoning import is_openai_official
 
@@ -82,36 +91,18 @@ OPENAI_FALLBACK_MODALITIES = ("text", "image")
 # measured capability of THIS deployment's private models
 # --------------------------------------------------------------------------- #
 
-# Measured 2026-09-16 against http://10.18.219.156:4000, by sending a 64x64
-# solid-red PNG and a 64x64 solid-blue PNG and asking for the dominant colour.
-# A model that answers "Red" then "Blue" is looking at the pixels; anything else
-# is guessing, and the verdict is recorded either way.
+# The measurements USED to be a dict here, keyed by slug. They are now data:
+# `$CODEX_HOME/model-config.jsonc` for the live values, seeded by
+# `model-config.seed.jsonc`. See modelconfig.py for why -- short version: a table
+# written in source meant the gateway renaming `deepseek-v4.1-flash-test` to
+# `deepseek-v4.1-flash` silently sent the new slug to DEFAULT_MODALITIES, and
+# Codex then refused every image paste client-side with no way to fix it short of
+# a new release.
 #
-#   deepseek-v4-flash          text   HTTP 400 "Model only supports text input;
-#                                     received unsupported content type
-#                                     'image_url'" -- the upstream server refuses
-#                                     outright, so enabling this breaks every turn.
-#   deepseek-v4.1-flash-test   image  Red / Blue  (correct)
-#   glm-5.3-flash              image  Red / Blue  (correct)
-#   qwen3-5-397b               image  Red / Blue  (correct)
-#   xinghai-ultra              text   ACCEPTS the payload and returns 200, but is
-#                                     not looking, and does not do so consistently:
-#                                     one run answered "Black" / "Orange" for a red
-#                                     and a blue image (confident nonsense), another
-#                                     declined outright ("I am unable to determine").
-#                                     Either way it cannot be trusted with an image,
-#                                     and unlike the deepseek case there is no error
-#                                     for the user to notice -- which is exactly why
-#                                     this is measured rather than declared.
-#
-# Re-measure with `--probe-modalities` after the backends change.
-MEASURED_MODALITIES: dict[str, tuple[str, ...]] = {
-    "deepseek-v4-flash": ("text",),
-    "deepseek-v4.1-flash-test": ("text", "image"),
-    "glm-5.3-flash": ("text", "image"),
-    "qwen3-5-397b": ("text", "image"),
-    "xinghai-ultra": ("text",),
-}
+# The measurement METHOD is unchanged and still lives here (`probe_images`,
+# `judge`, and `--probe-modalities` to run them). Re-measure after the backends
+# change, then record the verdict in the config file -- a slug rename is a
+# re-measure, not a find-and-replace.
 
 
 def store_path() -> Path:
@@ -176,8 +167,12 @@ def openai_modalities_from_cache(model_id: str) -> list[str]:
 def load() -> dict[str, object]:
     """The `$CODEX_HOME/private-modalities.json` map, or {} when absent/broken.
 
+    The OLDER store, read but never written now -- `model-config.jsonc` outranks
+    it. Kept so a machine configured before that file existed keeps its choices.
+
     A malformed file must not take the toolkit down: the catalog can always be
-    regenerated from the measured table, so this degrades instead of raising.
+    rebuilt from `model-config.jsonc` and the seed, so this degrades instead of
+    raising.
     """
     path = store_path()
     if not path.exists():
@@ -214,8 +209,8 @@ def configure(model_id: str, modalities: list[str] | tuple[str, ...] | str) -> l
     chosen = _modalities(modalities)
     if not chosen:
         raise ValueError(
-            f"no usable modalities in {modalities!r}; "
-            f"expected a subset of {', '.join(KNOWN_MODALITIES)}"
+            f"{modalities!r} 中没有可用的输入类型；"
+            f"应为 {', '.join(KNOWN_MODALITIES)} 的子集"
         )
     store = load()
     store[model_id] = {"input_modalities": chosen}
@@ -236,22 +231,33 @@ def clear(model_id: str) -> bool:
 # resolution
 # --------------------------------------------------------------------------- #
 
-def modalities_for(model_id: str, raw_meta: dict | None = None) -> list[str]:
+def modalities_for(model_id: str, raw_meta: dict | None = None,
+                   toolkit: str = modelconfig.TOOLKIT_CODEX) -> list[str]:
     """The catalog `input_modalities` for one model.
 
     Order, most specific first:
 
-      1. OpenAI's own models -- always `models_cache.json`, never the user file.
-         Their capability is OpenAI's to declare and the catalog replaces theirs.
-      2. An explicit entry in `private-modalities.json`.
-      3. What the gateway advertises in `GET /v1/models` for that model. Nothing
+      1. OpenAI's own models -- always `models_cache.json`, never any config file.
+         Their capability is OpenAI's to declare and the catalog replaces theirs,
+         so a value we write for `gpt-5.6-sol` overrides what OpenAI shipped.
+      2. `$CODEX_HOME/model-config.jsonc` -- the user's file.
+      3. `private-modalities.json` -- the older per-model store. Still read so a
+         machine configured before the config file existed keeps its choices, but
+         no longer written.
+      4. What the gateway advertises in `GET /v1/models` for that model. Nothing
          on this deployment does, but LiteLLM will pass such a field through if a
          backend ever sends one.
-      4. MEASURED_MODALITIES -- this deployment's measured table.
-      5. DEFAULT_MODALITIES ("text") for a model nobody has measured.
+      5. `model-config.seed.jsonc` -- this deployment's measured verdict.
+      6. `_defaults` / `_toolkits` from the config file, then DEFAULT_MODALITIES
+         ("text") if even that is unreadable.
     """
     if is_openai_official(model_id):
         return openai_modalities_from_cache(model_id) or list(OPENAI_FALLBACK_MODALITIES)
+
+    chosen = normalize_entries(modelconfig.configured(model_id,
+                                                      modelconfig.FIELD_MODALITIES))
+    if chosen:
+        return chosen
 
     entry = load().get(model_id)
     if isinstance(entry, dict):
@@ -265,9 +271,13 @@ def modalities_for(model_id: str, raw_meta: dict | None = None) -> list[str]:
         if advertised:
             return advertised
 
-    measured = MEASURED_MODALITIES.get(model_id)
+    # Seed first, then the defaults block. `normalize_entries` drops anything
+    # outside KNOWN_MODALITIES, so a hand-edited typo degrades to the fallback
+    # instead of reaching the catalog and stopping Codex from starting.
+    measured = normalize_entries(
+        modelconfig.suggested_value(model_id, modelconfig.FIELD_MODALITIES, toolkit))
     if measured:
-        return list(measured)
+        return measured
 
     return list(DEFAULT_MODALITIES)
 
@@ -340,17 +350,16 @@ def judge(answers: dict[str, str]) -> tuple[bool, str]:
 
     if (any(p in red_text.lower() for p in DECLINE_PHRASES)
             and any(p in blue_text.lower() for p in DECLINE_PHRASES)):
-        return False, "declined both -- it knows it has no vision, which is honest but not useful"
+        return False, "两张图都拒答 —— 它知道自己没有视觉能力，诚实但没用"
 
     red_ok = _families(red_text) == {"red"}
     blue_ok = _families(blue_text) == {"blue"}
 
     if red_ok and blue_ok:
-        return True, "told red from blue -- it is really reading the image"
+        return True, "能区分红色和蓝色 —— 它确实在看图"
     if not red_ok and not blue_ok:
-        return False, ("named neither colour -- it is not looking at the pixels, "
-                       "whatever it returns")
-    which = "red" if red_ok else "blue"
-    other = "blue" if red_ok else "red"
-    return False, (f"got the {which} image right but not the {other} one -- "
-                   "consistent with guessing, not seeing")
+        return False, ("两种颜色都没说对 —— 无论它返回什么，它都没有在看像素")
+    which = "红色" if red_ok else "蓝色"
+    other = "蓝色" if red_ok else "红色"
+    return False, (f"{which}图说对了，但{other}图没说对 —— "
+                   "更像是猜的，而不是真的看到了")

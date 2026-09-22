@@ -199,6 +199,17 @@ def codex_auth() -> Path:
     return codex_home() / "auth.json"
 
 
+def codex_models_cache() -> Path:
+    """Codex's own model list, written when it signs in.
+
+    Only OpenAI's models are read from here (their reasoning levels and input
+    types are OpenAI's to declare, and the catalog we write REPLACES theirs, so
+    omitting them would revoke official capability). A headless box that never
+    signed in has no cache -- callers fall back to a conservative set.
+    """
+    return codex_home() / "models_cache.json"
+
+
 def codex_binary() -> Path | None:
     """The `codex` executable -- extension-bundled copy, else whatever is on PATH."""
     import shutil
@@ -242,21 +253,21 @@ class Report:
     def render(self) -> str:
         def rows(title: str, items: list) -> list[str]:
             if not items:
-                return [f"  {title}: not found"]
+                return [f"  {title}: 未找到"]
             lines = [f"  {title}:"]
             for i in items:
-                mark = "" if Path(i).exists() else "   (will be created)"
+                mark = "" if Path(i).exists() else "   （将会创建）"
                 lines.append(f"      {i}{mark}")
             return lines
 
-        lines = ["discovered:"]
-        lines += rows("editor settings.json", self.claude_editor_settings)
-        lines += rows("workspace settings.json", self.claude_workspace_settings)
-        lines += rows("claude CLI settings.json", self.claude_cli_settings)
-        lines += rows("claude binary", self.claude_binaries)
+        lines = ["检测结果："]
+        lines += rows("编辑器 settings.json", self.claude_editor_settings)
+        lines += rows("工作区 settings.json", self.claude_workspace_settings)
+        lines += rows("claude 命令行 settings.json", self.claude_cli_settings)
+        lines += rows("claude 可执行文件", self.claude_binaries)
         lines += rows("codex config.toml", [self.codex_config] if self.codex_config else [])
         lines += rows("codex auth.json", [self.codex_auth] if self.codex_auth else [])
-        lines += rows("codex binary", [self.codex_binary] if self.codex_binary else [])
+        lines += rows("codex 可执行文件", [self.codex_binary] if self.codex_binary else [])
         return "\n".join(lines)
 
 

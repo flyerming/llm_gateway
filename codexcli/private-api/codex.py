@@ -44,21 +44,35 @@ empty `models` array is rejected with "must contain at least one model". The
 remaining keys of Codex's own catalogue entries are optional; we set the handful
 that change behaviour and leave the rest to their defaults.
 
-Two of the required keys MOVED during the 0.14x line, and this is the whole
-reason `MIN_SUPPORTED_VERSION` exists:
+TARGET VERSION
+--------------
+This toolkit is written for codex-cli 0.154.0 (`TARGET_VERSION`). Every tool run
+prints the binary's version and how it compares, so a box running something else
+says so out loud instead of failing later. When a newer release changes the
+config or catalog surface, re-adapt against it and move the constant.
+
+The key set above is 0.154.0's, read off its `ModelInfo` struct. It is also
+0.145's, plus one key and minus another -- which is the whole reason
+`MIN_SUPPORTED_VERSION` exists (each boundary read off that release's source):
 
     <=0.144  supports_reasoning_summaries          (required, bool)
     0.145+   supports_reasoning_summary_parameter  (renamed; #[serde(default = "default_true")])
+    0.155+   supports_reasoning_summaries          (dropped entirely)
 
-    supports_parallel_tool_calls  required from 0.143 until it was dropped
-                                  somewhere before 0.155
+    supports_parallel_tool_calls  0.143 .. 0.147, required throughout; off
+                                  `ModelInfo` from 0.148
+
+    base_instructions  a plain `ModelInfo` field through 0.146; off it from
+                       0.147, but still accepted -- a legacy shim promotes it
+                       into `model_messages.instructions_template` and errors
+                       if neither is set. We keep sending the old spelling.
 
 A catalogue written for one side of that rename fails on the other with a
 `missing field` error before Codex ever starts, which is exactly what happened
 on the 0.144.1 box. So we emit ALL THREE spellings. That is safe because
 `ModelInfo` is not `#[serde(deny_unknown_fields)]` in any version from 0.143
 through main -- an unrecognised key is ignored, so one generated catalog loads
-on every release in the supported range.
+on every release in the supported range, 0.154.0 included.
 
 Both summary flags are `false` on purpose, and it is a 400 either way: setting
 `supports_reasoning_summaries`/`..._parameter` is what makes Codex put
@@ -92,6 +106,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 import modalities
+import modelconfig
 import reasoning
 from tomlpatch import TomlFile
 
@@ -272,12 +287,12 @@ def set_env_var(name: str, value: str) -> str:
     marker = f"export {name}="
     existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
     if marker in existing:
-        return f"{name} already exported in {rc} (edit it there to rotate)"
+        return f"{name} 已在 {rc} 中导出（可在该文件里修改以轮换密钥）"
 
     with rc.open("a", encoding="utf-8") as fh:
         fh.write(f'\n# added by codexcli/private_api.py: Codex gateway key\n'
                  f'export {name}="{value}"\n')
-    return f'appended {marker}... to {rc} (open a new shell)'
+    return f"已把 {marker}... 追加到 {rc}（请打开新终端）"
 
 
 def env_var_is_set(name: str) -> bool:
@@ -362,6 +377,11 @@ TRUNCATION_POLICY = {"mode": "tokens", "limit": 10000}
 # Gateways rarely report a context length (LiteLLM only fills `max_input_tokens`
 # for models it has metadata for), and an entry without one makes Codex fall back
 # to something tiny. 128K is a safe floor for a modern coding model.
+#
+# NO LONGER THE PRIMARY SOURCE: `context_window_for` reads the user's
+# `model-config.jsonc`, then the gateway, then `model-config.seed.jsonc`, and only
+# falls back here. Kept as the last resort for an unreadable config file -- the
+# per-model resolution order is in that function's docstring.
 DEFAULT_CONTEXT_WINDOW = 128_000
 
 # How long a refreshed catalog is trusted for, in the wrapper's fast path. Codex
@@ -375,15 +395,21 @@ REFRESH_TTL_SECONDS = 300
 # which codex versions this catalog works on
 # --------------------------------------------------------------------------- #
 
+# The release this toolkit is written for. The config keys it writes, the
+# `wire_api` it insists on, and the catalog key set all come from 0.154.0's own
+# source. Move this -- and re-check that surface -- when adapting to a newer
+# codex, rather than letting the version quietly drift ahead of the code.
+TARGET_VERSION = (0, 154, 0)
+
 # The oldest release whose ModelInfo we have checked against its own source. The
 # required-key set was stable from here until the 0.145 rename, which we cover by
 # emitting both spellings; below this we have no evidence either way, so the
 # toolkit says so rather than guessing.
 MIN_SUPPORTED_VERSION = (0, 143)
 
-# The newest release the generated catalog has actually been parsed by, either
-# through `codex debug models` (0.153.4) or by deriving the key set from its
-# source (main/0.155 alphas).
+# The newest release the generated catalog has actually been parsed by, through
+# `codex debug models` against a real binary (0.153.4, the newest on hand). The
+# 0.154.0 key set is verified from source instead; nothing here has run 0.154.0.
 TESTED_THROUGH_VERSION = (0, 153, 4)
 
 
@@ -401,34 +427,80 @@ def parse_version(text: str | None) -> tuple[int, ...] | None:
     return tuple(int(g) for g in m.groups() if g is not None)
 
 
+def _vstr(v: tuple[int, ...]) -> str:
+    return ".".join(str(p) for p in v)
+
+
+def target_version() -> str:
+    """The codex release this toolkit is adapted to, as `0.154.0`."""
+    return _vstr(TARGET_VERSION)
+
+
 def version_note(version: str | None) -> tuple[bool, str]:
     """`(ok, one-line verdict)` for the codex version in use.
 
-    `ok` is False only when the binary is provably too old. An unreadable version
-    is reported as ok with a caveat -- refusing to work because `--version`
-    failed would be worse than the risk it guards against.
+    `ok` is False only when the binary is provably too old. Anything at or above
+    `MIN_SUPPORTED_VERSION` is allowed to run -- including versions past the
+    target, which get a warning rather than a refusal, because the catalog has
+    survived every rename so far and a false stop is worse than the risk it
+    guards against. An unreadable version is reported as ok with a caveat.
     """
     parsed = parse_version(version)
-    lo = ".".join(str(p) for p in MIN_SUPPORTED_VERSION)
-    hi = ".".join(str(p) for p in TESTED_THROUGH_VERSION)
+    target = target_version()
+    lo = _vstr(MIN_SUPPORTED_VERSION)
     if parsed is None:
-        return True, (f"codex version unknown -- this toolkit is built for "
-                      f"{lo} .. {hi}; verify with `codex --version`")
+        return True, (f"未知 codex 版本 —— 本工具适配的版本是 "
+                      f"{target}；可用 `codex --version` 确认")
     if parsed < MIN_SUPPORTED_VERSION:
-        return False, (f"{version} is OLDER than the oldest supported release "
-                       f"({lo}). The catalog it writes may be rejected at "
-                       f"startup -- upgrade codex, or expect `missing field` "
-                       f"errors from its model catalog parser.")
-    if parsed > TESTED_THROUGH_VERSION:
-        return True, (f"{version} is newer than the last release tested "
-                      f"({hi}); the catalog format has moved before, so if "
-                      f"`codex` fails to start, re-run with a matching toolkit.")
-    return True, f"{version} is in the supported range ({lo} .. {hi})"
+        return False, (f"{version} 低于最低支持版本（{lo}）。"
+                       f"它写入的模型目录可能无法在启动时解析 —— 请升级 codex，"
+                       f"否则可能遇到模型目录解析器的 `missing field` 报错。")
+    if parsed == TARGET_VERSION:
+        return True, f"{version} —— 正是本工具适配的版本"
+    if parsed > TARGET_VERSION:
+        return True, (f"{version} 高于适配版本（{target}）。"
+                      f"此前的配置和目录键名发生过变动，如果 `codex` 无法启动"
+                      f"或忽略了这些模型，请按 {version} 重新适配本工具。")
+    return True, (f"{version} 低于适配版本（{target}），但仍在支持范围内"
+                  f"（{lo}+）；模型目录也兼容较早的键名集合")
 
 
 def catalog_path() -> Path:
     from detect import codex_home
     return codex_home() / CATALOG_FILENAME
+
+
+def context_window_for(model_id: str, raw: dict | None = None,
+                       toolkit: str = modelconfig.TOOLKIT_CODEX) -> int:
+    """How much context Codex should assume for one model.
+
+    Order, most specific first:
+
+      1. `model-config.jsonc` (beside `private_api.py`) -- the user's file. This
+         is the only way to PIN a number, and the generated file writes one out
+         for every model so the value is visible and editable rather than implied.
+      2. The gateway's `max_input_tokens`. LiteLLM only fills it for models it
+         has metadata for, so it is frequently absent.
+      3. `model-config.seed.jsonc` / `_defaults` from the config file.
+      4. DEFAULT_CONTEXT_WINDOW -- last resort for an unreadable config file.
+
+    This is a **compaction trigger, not a client-side cap**: Codex auto-compacts
+    at 90% and hard-stops at 95% of it rather than raising. So over-filling it is
+    the dangerous direction -- Codex then sends oversized requests the gateway
+    400s -- which is why every fallback here is the conservative one.
+    """
+    meta = raw or {}
+    candidates = (
+        modelconfig.configured(model_id, modelconfig.FIELD_CONTEXT),
+        meta.get("max_input_tokens"),
+        modelconfig.suggested_value(model_id, modelconfig.FIELD_CONTEXT, toolkit),
+    )
+    for candidate in candidates:
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_CONTEXT_WINDOW
 
 
 def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
@@ -438,11 +510,7 @@ def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
     Codex sends it as `model` and LiteLLM routes on exactly that string.
     """
     raw = model.raw or {}
-    ctx = raw.get("max_input_tokens") or DEFAULT_CONTEXT_WINDOW
-    try:
-        ctx = int(ctx)
-    except (TypeError, ValueError):
-        ctx = DEFAULT_CONTEXT_WINDOW
+    ctx = context_window_for(model.id, raw)
 
     levels, default_level = reasoning.levels_for(model.id, raw)
     if not levels:
@@ -451,7 +519,7 @@ def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
     return {
         "slug": model.id,
         "display_name": model.id,
-        "description": f"Private gateway model · {ctx // 1000}K context",
+        "description": f"私有网关模型 · {ctx // 1000}K 上下文",
         "priority": priority,
         # "list" is what puts an entry in the picker; Codex's own hidden entries
         # (gpt-reserve) use "hide".
@@ -466,16 +534,22 @@ def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
         "support_verbosity": False,
         "truncation_policy": dict(TRUNCATION_POLICY),
         "experimental_supported_tools": [],
+        # Required through 0.146, and from 0.147 still required but via a legacy
+        # shim that maps it into `model_messages.instructions_template`. Works
+        # on 0.154.0 -- the target -- and everything older.
         "base_instructions": BASE_INSTRUCTIONS,
         # Required by <=0.144 and by 0.145+ respectively; the two names are the
         # same field before and after a rename. Both false -- see the module
         # docstring: `true` puts `reasoning.summary` on the wire and the gateway
-        # 400s it. Emitting both spellings is what lets one catalog serve a
-        # 0.144.1 box and a 0.153.4 box at once.
+        # 400s it. The `_parameter` spelling is what 0.154.0 reads, and its
+        # default is `true`, so this explicit `false` is load-bearing there;
+        # emitting the old spelling too is what lets one catalog serve a 0.144.1
+        # box and a 0.154.0 box at once.
         "supports_reasoning_summaries": False,
         "supports_reasoning_summary_parameter": False,
-        # Required from 0.143 to ~0.154, gone after. Nothing proves the backends
-        # do parallel tool calls, and a wrong `true` only shows up mid-task.
+        # Required 0.143 .. 0.147, ignored by 0.148+ (it is not a field of
+        # ModelInfo there). Nothing proves the backends do parallel tool calls,
+        # and a wrong `true` only shows up mid-task.
         "supports_parallel_tool_calls": False,
         "context_window": ctx,
         "max_context_window": ctx,
@@ -506,7 +580,7 @@ def write_catalog(path: Path, models: Iterable["Model"]) -> list[str]:
     catalog = build_catalog(models)
     entries = catalog["models"]
     if not entries:
-        raise ValueError("no chat-capable gateway models to put in the catalog")
+        raise ValueError("网关没有可用于目录的对话模型")
     path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic: the wrapper may be racing a running Codex that is reading this.
     tmp = path.with_suffix(path.suffix + ".tmp")

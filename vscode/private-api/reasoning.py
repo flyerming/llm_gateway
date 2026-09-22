@@ -1,38 +1,85 @@
 r"""Which thinking levels each model offers Codex, and which one it starts on.
 
-WHY THIS IS A SEPARATE MODULE
------------------------------
-Codex renders its "Reasoning" submenu purely from the model catalog we generate
-(`model_catalog_json`). The catalog entry carries two fields that decide it:
+THE SAME FILE NAME AS THE VSCode TOOLKIT, ON PURPOSE
+----------------------------------------------------
+The store is `$CODEX_HOME/private-reasoning.json`, byte-compatible with the one
+`vscode/private-api/reasoning.py` writes. A machine that has both toolkits
+configured reads the SAME per-model levels: whichever one wrote last wins, and
+neither has to be re-taught. Same for `private-modalities.json`.
+
+WHAT DRIVES THE MENU
+--------------------
+Codex renders its reasoning choice purely from the model catalog we generate
+(`model_catalog_json`). Two fields decide it:
 
     "supported_reasoning_levels": [{"effort": "low", "description": "..."}, ...]
     "default_reasoning_level": "low"
 
-Get those wrong and either the submenu vanishes or `codex` refuses to start.
-They are also the ONE thing a user genuinely wants to tune per model: a private
-DeepSeek backend and a private Qwen backend do not necessarily accept the same
-efforts. So the levels live in a small user-editable file rather than being
-hardcoded, and this module is the only place that knows how to read it.
+They are OBJECTS, not bare strings. `["low","high"]` makes the whole catalog
+fail to parse, which stops Codex from starting rather than degrading.
 
-THE SCHEMA IS OBJECTS, NOT STRINGS
+THE PRIVATE DEFAULT IS THREE RUNGS: low / high / max
+----------------------------------------------------
+The design brief asks for three, so DEFAULT_EFFORTS carries three and a private
+model gets that menu out of the box. The vscode toolkit stops at `xhigh` instead
+of `max` -- its webview could not draw a `max` row for a private provider (it
+showed Light/High and silently dropped everything above), so it tops out where
+its menu does. The CLI has no such limit, so it goes to the real ceiling.
+
+Measured against this deployment's backends (2026-09-16, `POST /v1/responses`
+with `reasoning.effort` set, one call per model per level):
+
+    deepseek-v4.1-flash        low, high, xhigh, max  -> 200
+                               minimal, medium        -> 400
+                                 "DeepSeek V4.1 reasoning_effort must be low,
+                                  high, xhigh, max, or an integer within [1, 10]"
+                               (measured under the slug `deepseek-v4.1-flash-test`,
+                                which the gateway has since renamed -- the levels
+                                travelled with the backend, only the id changed)
+    deepseek-v4-flash          every value -> 200  (the backend does not
+    glm-5.3-flash              validate at all -- it accepts `medium` and
+    qwen3-5-397b               quietly ignores it, so 200 proves nothing)
+    xinghai-ultra
+
+The strict backend accepts FOUR values, and `xhigh` is one of them; it is not a
+synonym for `max` but the rung below it. It is left out of the default because
+the brief asks for three -- but it is one flag away, as the `xhigh` shorthand
+(`--reasoning-levels xhigh`), for a model where the extra rung is wanted.
+
+The cost of dropping it from the default is a TUI detail: Codex files `max`
+(and `ultra`) under the **"Advanced Reasoning"** submenu, so the ordinary
+reasoning menu now offers only `low` / `high` and `max` needs that submenu.
+`xhigh`, had it been kept, would have been reachable from the ordinary menu.
+
+`minimal` and `medium` are deliberately absent: on the strict backend they are
+an HTTP 400 on every turn, and on the permissive ones they are indistinguishable
+from `high` -- a level that means nothing but looks like a choice.
+
+WHERE THE MENU ACTUALLY COMES FROM
 ----------------------------------
-An earlier version of `codex.py` emitted `["low", "high", "max"]`. That is wrong
-and silently breaks the catalog. Verified against two independent sources:
+The live value is in `$CODEX_HOME/model-config.jsonc`, which the user owns and
+edits; `model-config.seed.jsonc` carries the table above as data. That split is
+deliberate -- the reasoning levels were source constants until 2026-09-17, and so
+was the input-modality table, which is how a gateway slug rename turned into
+Codex refusing every image paste with no fix short of a new release. See
+modelconfig.py. This module keeps the ENUM (`KNOWN_EFFORTS`), the menu text, and
+the shorthands; the policy lives in the seed, and `DEFAULT_EFFORTS` below is only
+the last resort for an unreadable config file.
 
-  * `~/.codex/models_cache.json` -- the catalog Codex fetches for itself
-  * strings inside `codex.exe`, where the schema reads
-    `... default_reasoning_level supported_reasoning_levels shell_type ...`
-
-Both agree each level is `{"effort": <str>, "description": <str>}`.
+OVERRIDING
+----------
+Per model, with `--configure-reasoning` (which writes the older
+`private-reasoning.json` store), or by editing `model-config.jsonc` directly --
+the config file wins. An empty list is meaningful and kept: it means "no reasoning
+menu for this model", which is right for a plain chat model whose backend has no
+such knob.
 
 OPENAI'S OWN MODELS ARE LEFT ALONE
 ----------------------------------
-Codex ships a catalog for the models OpenAI serves, and this toolkit's catalog
-REPLACES that list -- so an entry we write for `gpt-5.6-sol` overrides whatever
-OpenAI intended, including its reasoning levels. To keep those "as they were",
-we copy the levels straight out of `models_cache.json` verbatim and ignore any
-user override for them. `--keep-builtin-models` is unrelated; this is about the
-per-entry fields, not which entries appear.
+For `gpt-*` / `o*` slugs the levels come out of `$CODEX_HOME/models_cache.json`
+verbatim, because the catalog we write REPLACES Codex's own and an entry we emit
+for `gpt-5.6-sol` overrides whatever OpenAI shipped. A headless box that has
+never signed in has no cache; those models then get OPENAI_FALLBACK_EFFORTS.
 """
 
 from __future__ import annotations
@@ -41,7 +88,20 @@ import json
 import re
 from pathlib import Path
 
-from detect import codex_home
+import modelconfig
+from detect import codex_home, codex_models_cache
+
+# >>> ONE OF THE TWO LINES THAT DIFFER FROM `codexcli/private-api/reasoning.py` <<<
+# This copy is the vscode one, so `_toolkits.vscode` in `model-config.jsonc` is
+# what applies (it stops at `xhigh` -- the webview cannot draw a `max` row).
+# Declared here rather than threaded through every call site: a default argument
+# that silently means "codexcli" in a vscode install is exactly the kind of thing
+# that gets forgotten.
+TOOLKIT = modelconfig.TOOLKIT_VSCODE
+
+# The other differing line is `DEFAULT_EFFORTS` further down, for the same reason.
+# Everything else must stay identical to the codexcli copy --
+# `diff codexcli/private-api/reasoning.py vscode/private-api/reasoning.py`
 
 # --------------------------------------------------------------------------- #
 # the store
@@ -49,45 +109,61 @@ from detect import codex_home
 
 STORE_FILENAME = "private-reasoning.json"
 
-# Descriptions are copied from OpenAI's own catalog so the submenu reads the same
+# Descriptions are copied from OpenAI's own catalog so the menu reads the same
 # whichever model the user picks.
 EFFORT_DESCRIPTIONS: dict[str, str] = {
-    "none": "No reasoning",
-    "minimal": "Barely any reasoning",
-    "low": "Fast responses with lighter reasoning",
-    "medium": "Balances speed and reasoning depth for everyday tasks",
-    "high": "Greater reasoning depth for complex problems",
-    "xhigh": "Extra high reasoning depth for complex problems",
-    "max": "Maximum reasoning depth for the hardest problems",
-    "ultra": "Maximum reasoning with automatic task delegation",
-    "persistent": "Keeps reasoning active across the whole session",
+    "none": "不进行思考",
+    "minimal": "几乎不思考",
+    "low": "快速响应，思考较少",
+    "medium": "在速度与思考深度之间平衡，适合日常任务",
+    "high": "更强的思考深度，适合复杂问题",
+    "xhigh": "极高的思考深度，适合复杂问题",
+    "max": "最大思考深度，适合最难的问题",
+    "ultra": "最大思考深度，并自动委派子任务",
+    "persistent": "整个会话期间持续保持思考",
 }
 
-# Every value Codex's own enum accepts -- read out of codex.exe. A level outside
-# this set makes the catalog fail to parse, which takes Codex down on startup
-# rather than degrading, so it is worth validating rather than trusting input.
+# Every value Codex's own enum accepts. A level outside this set makes the
+# catalog fail to parse, which takes Codex down on startup rather than
+# degrading, so input is validated rather than trusted.
 KNOWN_EFFORTS = tuple(EFFORT_DESCRIPTIONS)
 
-# What a private model gets when nobody has configured it.
+# What a private (custom_openai) model gets when nobody has configured it: the
+# three rungs the design brief asks for. See the module docstring -- the strict
+# backend also accepts `xhigh`, which is reachable via the `xhigh` shorthand
+# below rather than being part of the default.
 #
-# `max` is deliberately absent even though it is a valid effort value, our
-# backends accept it, and the picker has a label for it ("Max"). Codex will not
-# RENDER it: with `max` in this list the submenu shows only Light/High, and the
-# same happens for `gpt-5.6-sol`, whose catalog entry lists six levels. So the
-# ceiling tracks the provider rather than the model, and a level the user cannot
-# click is worse than one rung lower that they can. `xhigh` ("Extra High") is the
-# highest value the picker actually draws; it is what OpenAI's own gpt-5.5 entry
-# stops at too.
+# NO LONGER THE PRIMARY SOURCE. The live menu comes from the config file
+# (`model-config.jsonc`, seeded by `model-config.seed.jsonc`), which is what makes
+# it user-editable and what makes a per-toolkit divergence possible -- vscode stops
+# at `xhigh` because its menu cannot draw `max`. These two survive as the LAST
+# resort for an unreadable config file: a hand-edited or truncated
+# `model-config.jsonc` must cost the user their overrides, not their model menu.
 #
-# `max` still works if set directly (`--reasoning-levels low,high,max`, or
-# `model_reasoning_effort = "max"` in config.toml) -- it just cannot be picked
-# from the menu.
+# >>> THE ONE LINE THAT DIFFERS FROM `codexcli/private-api/reasoning.py` <<<
+# It has to: this is the toolkit's own last resort, and a last resort that hands
+# vscode a `max` rung revives the very display bug the `_toolkits.vscode` block
+# exists to avoid (the webview silently drops the row). Keep in sync with
+# `model-config.seed.jsonc`'s `_toolkits.vscode.reasoning_levels`.
 DEFAULT_EFFORTS = ("low", "high", "xhigh")
 DEFAULT_EFFORT = "high"
 
-# Used for OpenAI's models only when `models_cache.json` cannot be read. Kept
-# deliberately conservative: a level the model does not really support is worse
-# than a missing one, because the user only finds out mid-task.
+# Shorthands for `--reasoning-levels`, which accepts these names directly.
+PROFILE_PRIVATE = "private"   # low,high,max        (the default)
+PROFILE_THREE = "three"       # low,high,max        (alias of `private`)
+PROFILE_XHIGH = "xhigh"       # low,high,xhigh,max  (the strict backend's full set)
+PROFILE_NONE = "none"         # []  -- no reasoning menu at all
+PROFILES: dict[str, tuple[str, ...]] = {
+    PROFILE_PRIVATE: DEFAULT_EFFORTS,
+    PROFILE_THREE: DEFAULT_EFFORTS,
+    PROFILE_XHIGH: ("low", "high", "xhigh", "max"),
+    PROFILE_NONE: (),
+}
+
+# Used for OpenAI's models only when `models_cache.json` cannot be read (a
+# headless box that never signed in). Conservative on purpose: a level the model
+# does not really support is worse than a missing one, because the user only
+# finds out mid-task.
 OPENAI_FALLBACK_EFFORTS = ("low", "medium", "high", "xhigh")
 
 
@@ -105,6 +181,15 @@ def _levels(efforts: list[str] | tuple[str, ...] | str) -> list[dict[str, str]]:
         if name and name in KNOWN_EFFORTS and name not in {x["effort"] for x in out}:
             out.append({"effort": name, "description": EFFORT_DESCRIPTIONS[name]})
     return out
+
+
+def resolve_profile(spec: str) -> tuple[str, ...]:
+    """`--reasoning-levels` value -> effort tuple. `private`/`three`/`none` are
+    shorthands for the sets this deployment is known to accept."""
+    key = spec.strip().lower()
+    if key in PROFILES:
+        return PROFILES[key]
+    return tuple(e.strip() for e in spec.split(",") if e.strip())
 
 
 def normalize_entries(raw: object) -> list[dict[str, str]]:
@@ -144,7 +229,7 @@ def openai_levels_from_cache(model_id: str) -> tuple[list[dict[str, str]], str |
     Returns ([], None) when the cache is missing or has nothing for this slug;
     callers fall back to OPENAI_FALLBACK_EFFORTS.
     """
-    path = codex_home() / "models_cache.json"
+    path = codex_models_cache()
     if not path.exists():
         return [], None
     try:
@@ -207,19 +292,19 @@ def configure(model_id: str, efforts: list[str] | tuple[str, ...] | str,
               default: str | None = None) -> dict[str, object]:
     """Store one model's levels. Returns the entry that was written.
 
-    An empty `efforts` is meaningful and is kept: it means "no Reasoning submenu
-    for this model", which is how a plain non-reasoning chat model should look.
+    An empty `efforts` is meaningful and is kept: it means "no reasoning menu for
+    this model", which is how a plain non-reasoning chat model should look.
     """
     levels = _levels(efforts)
     entry: dict[str, object] = {"levels": levels}
     if levels:
-        chosen = default or levels[0]["effort"]
-        # A default outside the offered set would make Codex open the submenu on
-        # a value the user cannot even see.
+        chosen = default or DEFAULT_EFFORT
+        # A default outside the offered set would make Codex open the menu on a
+        # value the user cannot even see.
         if chosen not in {x["effort"] for x in levels}:
             raise ValueError(
-                f"default {chosen!r} is not one of the configured levels "
-                f"({', '.join(x['effort'] for x in levels)})"
+                f"默认档位 {chosen!r} 不在已配置的档位里"
+                f"（{', '.join(x['effort'] for x in levels)}）"
             )
         entry["default"] = chosen
 
@@ -238,27 +323,44 @@ def clear(model_id: str) -> bool:
     return True
 
 
+def clear_all() -> int:
+    store = load()
+    n = len(store)
+    save({})
+    return n
+
+
 # --------------------------------------------------------------------------- #
 # resolution
 # --------------------------------------------------------------------------- #
 
-def levels_for(model_id: str, raw_meta: dict | None = None) -> tuple[list[dict[str, str]], str | None]:
-    """The catalog levels + default for one model. `([], None)` = no submenu.
+def levels_for(model_id: str, raw_meta: dict | None = None,
+               toolkit: str = TOOLKIT) -> tuple[list[dict[str, str]], str | None]:
+    """The catalog levels + default for one model. `([], None)` = no reasoning menu.
 
     Order, most specific first:
 
-      1. OpenAI's own models -- always `models_cache.json`, never the user file.
-         Their behaviour is OpenAI's to define, and overriding it is the thing
-         the user asked us not to do.
-      2. An explicit entry in `private-reasoning.json`.
-      3. What the gateway advertises in `GET /v1/models` for that model.
-      4. DEFAULT_EFFORTS.
+      1. OpenAI's own models -- always `models_cache.json`, never a config file.
+         Their behaviour is OpenAI's to define.
+      2. `$CODEX_HOME/model-config.jsonc` -- the user's file.
+      3. `private-reasoning.json` -- the older per-model store. Still read so a
+         machine configured before the config file existed keeps its choices, but
+         no longer written.
+      4. What the gateway advertises in `GET /v1/models` for that model.
+      5. `model-config.seed.jsonc` for this slug, else `_defaults` /
+         `_toolkits[<toolkit>]` from the config file.
+      6. DEFAULT_EFFORTS -- last resort, for when the config file is unreadable.
     """
     if is_openai_official(model_id):
         levels, default = openai_levels_from_cache(model_id)
         if levels:
             return levels, default
         return _levels(OPENAI_FALLBACK_EFFORTS), OPENAI_FALLBACK_EFFORTS[0]
+
+    levels = normalize_entries(modelconfig.configured(model_id, modelconfig.FIELD_LEVELS))
+    if levels:
+        default = modelconfig.configured(model_id, modelconfig.FIELD_DEFAULT_LEVEL)
+        return levels, _checked_default(levels, default)
 
     entry = load().get(model_id)
     if entry is not None:
@@ -271,8 +373,27 @@ def levels_for(model_id: str, raw_meta: dict | None = None) -> tuple[list[dict[s
         levels = normalize_entries(meta.get(key))
         if levels:
             default = meta.get("default_reasoning_level") or meta.get("default_reasoning_effort")
-            if str(default) not in {x["effort"] for x in levels}:
-                default = levels[0]["effort"]
-            return levels, str(default)
+            return levels, _checked_default(levels, default)
+
+    levels = _levels(modelconfig.suggested_value(
+        model_id, modelconfig.FIELD_LEVELS, toolkit) or ())
+    if levels:
+        default = modelconfig.suggested_value(
+            model_id, modelconfig.FIELD_DEFAULT_LEVEL, toolkit)
+        return levels, _checked_default(levels, default)
 
     return _levels(DEFAULT_EFFORTS), DEFAULT_EFFORT
+
+
+def _checked_default(levels: list[dict[str, str]], default: object) -> str | None:
+    """Coerce a default that is not one of the offered levels.
+
+    A `default_reasoning_level` outside `supported_reasoning_levels` opens Codex's
+    picker on a value the user cannot see, so a hand-edited mismatch resolves to
+    the first level rather than being passed through.
+    """
+    names = {x["effort"] for x in levels}
+    if not names:
+        return None
+    text = str(default) if default is not None else ""
+    return text if text in names else levels[0]["effort"]

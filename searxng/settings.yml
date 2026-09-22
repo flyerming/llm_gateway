@@ -1,0 +1,74 @@
+# SearXNG 配置 —— 给私有网关当搜索后端用。
+#
+# 挂到容器里的 /etc/searxng/settings.yml。基础配置继承镜像自带的默认值
+# （use_default_settings: true），下面只写需要改的几项。
+#
+# 为什么要有这个文件，而不是靠 SEARXNG_* 环境变量：
+# searxng 镜像的 entrypoint 只在 /etc/searxng/settings.yml **不存在**时才用环境
+# 变量生成配置。我们挂了这份文件，所以环境变量对它无效，一切以这里为准。
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "private-searxng"
+  # 不对外暴露统计信息。
+  enable_metrics: false
+
+server:
+  # 必须改的随机值。真实值放 .env 的 SEARXNG_SECRET，密钥不进仓库 —— 但**不是**靠
+  # YAML 里引用变量做到的：镜像的 entrypoint 在容器启动时 grep 本文件里的
+  # `ultrasecretkey` 这个字面量，发现就地用 $SEARXNG_SECRET 替换，没设时大声告警。
+  # 所以本文件在 compose 里是**可写**挂载的 —— 只读会让替换那一步失败。
+  #
+  # ⚠️ 别改成 `!ENV [SEARXNG_SECRET, ...]` 之类的变量引用：SearXNG 用不带自定义
+  #   constructor 的 yaml.safe_load 读这个文件，遇到 `!ENV` 会直接
+  #   `ConstructorError: could not determine a constructor for the tag '!ENV'` 并在
+  #   启动时崩溃重启（2026.9.17 实测）。配置来源只能是这个文件本身 + entrypoint 的替换。
+  secret_key: "ultrasecretkey"
+
+  # limiter 是给公网实例防爬的，它会把非浏览器的 API 调用挡掉 —— 我们的
+  # MCP 服务正是这种调用。私有内网实例，关掉。
+  limiter: false
+  public_instance: false
+
+  # 只在 compose 网络里被 mcp 服务访问，不发布到宿主机。
+  bind_address: "0.0.0.0:8080"
+
+  # 强制 https 会让内网 http 访问被重定向，关掉。
+  base_url: false
+  image_proxy: false
+
+search:
+  # 0 = 不过滤。私有实例，交给调用方用 safesearch 参数按需覆盖。
+  safe_search: 0
+  default_lang: "auto"
+  autocomplete: ""
+
+  # ★ 关键项：不加上 json，SearXNG 会用 403 + HTML 页面拒绝 format=json 的请求，
+  #   MCP 服务会报「Content-Type 不是 JSON」。html 保留是为了能用浏览器直接
+  #   打开看看效果。
+  formats:
+    - html
+    - json
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 20.0
+  # 所有上游搜索引擎的请求都走 compose 里的 mihomo（proxy:7890），和
+  # cli-proxy-api 出网走的是同一条链路，节点规则统一在 network/mihomo 里管。
+  #
+  # 要直连（比如只想用百度和必应，不想绕节点）就把下面两行注释掉 ——
+  # SearXNG 的 outgoing.proxies 留空即直连。不要用空字符串代替注释，空值会
+  # 被当成一个无效的代理地址传给 httpx。
+  # 这里**不引用 .env**，是硬编码的（原因见上面 secret_key 那段：本文件读不了变量）。
+  # 换代理地址就直接改这两行。
+  proxies:
+    http: "http://proxy:7890"
+    https: "http://proxy:7890"
+
+ui:
+  static_use_hash: true
+
+# 引擎用镜像默认的那一套（google/bing/duckduckgo/baidu 等）。要增删或者给某个
+# 引擎单独设代理，在这里加一段 engines: 覆盖即可，语法见 SearXNG 官方文档。

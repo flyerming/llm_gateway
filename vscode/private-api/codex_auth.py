@@ -51,20 +51,20 @@ def status() -> tuple[str, str]:
     """(state, detail). Never returns or prints any part of the credential."""
     path = auth_path()
     if not path.exists():
-        return "MISSING", f"no {path} -- Codex will show a login prompt"
+        return "MISSING", f"没有 {path} —— Codex 会弹出登录提示"
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        return "UNREADABLE", f"{path} is not valid JSON ({e})"
+        return "UNREADABLE", f"{path} 不是合法的 JSON（{e}）"
     if not isinstance(data, dict):
-        return "UNREADABLE", f"{path} is not a JSON object"
+        return "UNREADABLE", f"{path} 不是 JSON 对象"
 
     if data.get("OPENAI_API_KEY"):
-        return "API_KEY", f"signed in with an API key ({path})"
+        return "API_KEY", f"已用 API 密钥登录（{path}）"
     if data.get("tokens"):
-        return "CHATGPT", f"signed in with a ChatGPT account ({path})"
-    return "EMPTY", f"{path} has neither an API key nor tokens"
+        return "CHATGPT", f"已用 ChatGPT 账号登录（{path}）"
+    return "EMPTY", f"{path} 里既没有 API 密钥也没有 token"
 
 
 def write_api_key_auth(api_key: str) -> tuple[Path, str | None]:
@@ -75,7 +75,7 @@ def write_api_key_auth(api_key: str) -> tuple[Path, str | None]:
     omitting an optional field is untested territory for no benefit.
     """
     if not api_key.strip():
-        raise ValueError("refusing to write an empty API key")
+        raise ValueError("拒绝写入空的 API 密钥")
 
     path = auth_path()
     path.parent.mkdir(parents=True, exist_ok=True)

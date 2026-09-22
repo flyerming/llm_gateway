@@ -1,0 +1,13 @@
+.git
+deepseek-harness-dsh-*/
+.dsh-build
+node_modules
+**/node_modules
+**/.vite
+**/.cache
+**/*.tsbuildinfo
+**/dist
+**/coverage
+**/playwright-report
+**/test-results
+**/*.log

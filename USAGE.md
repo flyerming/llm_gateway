@@ -68,6 +68,34 @@ CONSOLE_PASSWORD=<强密码>
 CLIPROXY_API_KEY=<随机长字符串>
 # 管理面 key：仅控制台调 /v0/management 用。必须与上面不同！
 CLIPROXY_MANAGEMENT_KEY=<另一组随机长字符串>
+
+# ---- SearXNG 搜索 ----
+# SearXNG 自己的 secret_key。entrypoint 会在容器启动时拿它替换 settings.yml 里的
+# `ultrasecretkey` 字面量。不设会退化成 ultrasecretkey 并在日志里告警。
+SEARXNG_SECRET=<随机长字符串>
+# ⚠️ 上游代理地址【不在这里配】：SearXNG 用不带自定义 constructor 的 yaml.safe_load
+#    读 settings.yml，引用不了环境变量（写 !ENV 会让容器启动即崩）。
+#    要改代理直接改 searxng/settings.yml 的 outgoing.proxies，然后 restart searxng。
+#    要直连就把那两行注释掉。
+
+# ---- MCP 搜索端点 ----
+# ⚠️ 这是【服务端内部凭据】，不是用户密钥：只给「LiteLLM 网关 → searxng-mcp」这一跳用，
+#    存在网关的注册记录里。客户端不再需要它——用户搜东西用的是他自己的 LiteLLM key。
+#    不设这个，docker compose up 直接报错退出。
+MCP_SEARXNG_TOKEN=<随机长字符串>
+
+# ---- MCP 端点的 Host 白名单 ----
+# 网关以容器身份经 compose 网络来连，Host 头就是 searxng-mcp:8090。
+# ★ 用【服务名】不要用 IP：服务名在任何环境下都一样，所以这一项不含环境相关的配置，
+#   换机器、换 IP、换环境都不用改。漏改的症状是网关那跳报 unhealthy，而 searxng-mcp
+#   自己的 /health 照样是绿的（它不受这层限制）——指错方向。
+#   这一项和 searxng/register_mcp.py 注册的 URL 必须同源，那个脚本每次运行都会核对。
+MCP_SEARXNG_ALLOWED_HOSTS=searxng-mcp:8090
+MCP_SEARXNG_ALLOWED_ORIGINS=http://searxng-mcp:8090
+
+# 固定镜像版本用（默认都取 latest）
+#SEARXNG_IMAGE=searxng/searxng:latest
+#MCP_SEARXNG_IMAGE=isokoliuk/mcp-searxng:latest
 ```
 
 生成随机值：
@@ -78,7 +106,9 @@ openssl rand -hex 32
 
 三个「必须」：
 
-1. 五把钥匙**互不相同**（尤其 `CLIPROXY_API_KEY` ≠ `CLIPROXY_MANAGEMENT_KEY`）
+1. 六把钥匙**互不相同**（尤其 `CLIPROXY_API_KEY` ≠ `CLIPROXY_MANAGEMENT_KEY`，
+   以及 `MCP_SEARXNG_TOKEN` 不要复用别的值——虽然它现在只留在服务端，但它守的是
+   「能抓任意 URL」的那个工具）
 2. 都不要填成 `LITELLM_MASTER_KEY`
 3. 文件权限收紧：`chmod 600 .env`
 
@@ -96,15 +126,18 @@ docker compose up -d
 docker compose ps
 ```
 
-五个服务应全部运行。`proxy` 可能显示 `unhealthy`——这只是 healthcheck 命令在
+七个服务应全部运行（`proxy`、`cli-proxy-api`、`proxy-console`、`litellm`、`db`、
+`searxng`、`searxng-mcp`）。`proxy` 可能显示 `unhealthy`——这只是 healthcheck 命令在
 Alpine/busybox 上的参数差异，不影响实际转发（其他服务只依赖 `service_started`）。
 处理办法见 [9.4](#94-proxy-显示-unhealthy)。
+
+`searxng-mcp` 会等 `searxng` 健康后才起，所以它启动最慢，`up -d` 之后等十几秒再看 `ps`。
 
 ---
 
 ## 3. 部署后验证
 
-按顺序做这三步，每步都对应一条命令。
+按顺序做这四步，每步都对应一条命令。
 
 ### 3.1 确认 mihomo 能出网
 
@@ -141,6 +174,32 @@ print(json.dumps(json.load(urllib.request.urlopen(url, timeout=10)), ensure_asci
 ```bash
 docker compose exec litellm python -c "import httpx; print(httpx.get('http://aix-backup.hismarttv.com/', timeout=15).status_code)"
 ```
+
+### 3.4 确认搜索能用（MCP）
+
+搜索走的是**客户端侧**的 MCP，但服务端要先把后端注册进网关。**分三步，别跳步**：
+
+```bash
+# 第一步：注册进网关（幂等；服务器上做一次即可，重启不丢）
+python searxng/register_mcp.py --dry-run    # 先看要发什么，token 打码
+python searxng/register_mcp.py
+
+# 第二步：★ 确认网关→searxng-mcp 这一跳真的通。status 必须是 healthy。
+python searxng/register_mcp.py --check
+
+# 第三步：用一个【普通用户的 key】走网关真握手（不要用 master key，用 master 验等于没验）
+USER_KEY='sk-某个普通用户的key'
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://<网关>:4000/searxng/mcp \
+  -H "Authorization: Bearer $USER_KEY" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+`200` 才算过。**第二步报 `unhealthy` 几乎总是 `MCP_HTTP_ALLOWED_HOSTS` 里没有
+`searxng-mcp:8090`**——注意此时 `searxng-mcp` 自己的 `/health` 仍然可能是绿的，指错方向。
+`404 MCP server ... not found` 是没注册（回到第一步）。
+
+完整的五层验证（含真搜一次、真读一页正文）见 **[searxng/README.md](searxng/README.md)**。
 
 ---
 
@@ -406,6 +465,9 @@ docker compose logs -f cli-proxy-api proxy proxy-console litellm
 docker compose restart proxy              # 改过 mihomo config.yaml 后
 docker compose up -d litellm              # 改过 litellm 的 NO_PROXY 后
 docker compose restart cli-proxy-api proxy-console   # 轮换 CLIPROXY_* 密钥后
+docker compose restart searxng           # 改过 searxng/settings.yml 后
+docker compose up -d searxng-mcp         # 改过 MCP_SEARXNG_* 变量后（要重建才重读 .env）
+python searxng/register_mcp.py           # 改过 MCP_SEARXNG_TOKEN 或 searxng-mcp 地址后
 
 # 看实际生效的 compose 配置（排错变量替换问题）
 docker compose config
@@ -533,16 +595,50 @@ print(r.status_code, r.text[:500])
 docker compose logs -f cli-proxy-api
 ```
 
+### 9.9 搜索用不了
+
+**先记住一件事：`searxng-mcp` 的 `/health` 绿了什么都不代表**——它是官方免鉴权端点，且不会去碰
+SearXNG。所以别拿它当证据。按下面这张表定位：
+
+| 症状 | 最可能的原因 | 怎么办 |
+| --- | --- | --- |
+| `--check-search` 报 **401** | 搜索那步跑在模型配置之前，或用了不同的 `--api-key` | 客户端用的是**你自己的 LiteLLM key**，没有第二个搜索 key。重跑主流程命令即可 |
+| `--check-search` 报 **404** `MCP server ... not found` | 网关不知道这个 MCP server（没注册）或 URL 带了 `/v1` | 在网关那台机器上跑 `python searxng/register_mcp.py` |
+| `register_mcp.py --check` 报 **unhealthy**，但 searxng-mcp 的 `/health` 是绿的 | `MCP_HTTP_ALLOWED_HOSTS` 里没有 `searxng-mcp:8090`（**连端口精确比对**） | 检查 `.env` 那一项；脚本每次运行都会核对并报警 |
+| `--check-search` 提示 **配置的 URL 与网关端点不一致** | 客户端配置是旧地址（网关换过地址/端口） | 重跑主流程命令，它会重写 |
+| 客户端 403 | 网关自身的策略（key 范围 / 允许的模型） | 这层不再是 Host 白名单——客户端只跟网关说话 |
+| 握手能过，但一搜就失败 | SearXNG 自己搜不出来 | 见下 |
+| Claude Code 的 `/mcp` 里没有 `searxng` | 写错文件或漏了 `type` | 必须是 `~/.claude.json` 且 `"type": "http"`，见 [vscode/README.md](vscode/README.md#搜索web-search) |
+| `searxng` 容器 `Restarting (1)`，`searxng-mcp` 报 `dependency failed to start` | `settings.yml` 里写了 `!ENV` 或任何自定义 YAML 标签 | SearXNG 用裸 `yaml.safe_load` 读它，会 `ConstructorError` 崩溃。改成硬编码值，见 [searxng/README.md](searxng/README.md) |
+
+> `searxng` 启动失败时 `docker inspect` 会给出一个很有迷惑性的组合：`State.Health` 是
+> `unhealthy`，但 `FailingStreak: 0` 且 `Log: []`。**空 Log 说明 healthcheck 一次都没跑过**——
+> 是应用在启动阶段就死了。别去调 healthcheck 命令，直接看 `docker compose logs searxng`。
+
+SearXNG 自己搜不出来时，进容器直接问它（它不发布端口）：
+
+```bash
+docker compose exec searxng wget -qO- 'http://127.0.0.1:8080/search?q=test&format=json' | head -c 400
+```
+
+返回 **403 或一页 HTML** → `searxng/settings.yml` 的 `search.formats` 里丢了 `json`。
+返回空或超时 → 上游引擎出不去，看 `docker compose logs --tail=30 searxng`，多半是 `proxy`
+或节点规则的问题（和 CLIProxyAPI 出网是同一条链路）。
+
+完整的四层验证见 [searxng/README.md](searxng/README.md)。
+
 ---
 
 ## 10. 安全注意事项
 
 | 项 | 要求 |
 | --- | --- |
-| 端口暴露 | 只发布 8787 和 4000；**不要**额外发布 7890 / 8317 / 9090 / 1455 |
+| 端口暴露 | 只发布 8787 和 4000；**不要**额外发布 7890 / 8317 / 9090 / 8080 / 8090 / 1455 |
+| 8090（MCP 后端）访问控制 | **不发布端口**，只在 compose 网络里可见。入口是网关的 `/searxng/mcp`，用 LiteLLM virtual key 鉴权（`allow_all_keys: true`），所以「谁能调」由网关的 key 体系决定，不再靠网络边界。`MCP_SEARXNG_TOKEN` 只是服务端内部凭据 |
+| 搜索工具的暴露面 | `web_url_read` 能抓**任意 URL**，等于一个出网抓取器。它现在挂在网关后面，所以放行等于「任何持有合法 key 的人都能用」——发 key 前想清楚这一点 |
 | 8787 访问控制 | 强 `CONSOLE_PASSWORD` + 防火墙限制来源网段，**不要暴露到公网** |
 | `.env` | `chmod 600`，不进版本库，单独备份 `LITELLM_SALT_KEY` |
-| 密钥轮换 | `CLIPROXY_*` 轮换要同时更新 CLIProxyAPI 与控制台并重启两者 |
+| 密钥轮换 | `CLIPROXY_*` 轮换要同时更新 CLIProxyAPI 与控制台并重启两者；`MCP_SEARXNG_TOKEN` 轮换只要改 `.env` → `docker compose up -d searxng-mcp` → **重跑 `python searxng/register_mcp.py`**。**客户端不用动**——它拿的是自己的 LiteLLM key，跟这个 token 无关 |
 | 凭据管理 | `CLIPROXY_MANAGEMENT_KEY` 权限高于模型 API key，**不要发给客户端** |
 | 备份访问 | `cliproxy_auths` 卷内的 OAuth JSON 等同账号凭据，备份件要控权限 |
 | 发布仓库前 | `network/mihomo/config.yaml`（订阅令牌）和 `network/clash/RihD9ROJzl50.yaml`（节点凭据）**必须先处理**，详见 [REVIEW.md](REVIEW.md) |

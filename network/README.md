@@ -54,7 +54,7 @@ docker compose up -d
 docker compose ps
 ```
 
-五个服务应当都处于运行状态。`proxy` 的 healthcheck 在不同 Alpine/busybox 版本上可能显示 `unhealthy`，这只影响状态标记，不影响 `service_started` 依赖下的实际转发；详见“常见问题”。
+七个服务应当都处于运行状态（`proxy`、`cli-proxy-api`、`proxy-console`、`litellm`、`db`、`searxng`、`searxng-mcp`）。`proxy` 的 healthcheck 在不同 Alpine/busybox 版本上可能显示 `unhealthy`，这只影响状态标记，不影响 `service_started` 依赖下的实际转发；详见“常见问题”。
 
 ## 在控制台登录 Codex
 
@@ -62,7 +62,20 @@ docker compose ps
 2. 在“ChatGPT/Codex 订阅”面板点击“登录 Codex”。控制台向 CLIProxyAPI 请求一次性 OAuth URL，并自动打开新窗口。
 3. 在 OAuth 页面完成 ChatGPT 登录和授权。若回调能直接回到 CLIProxyAPI，页面会自动轮询并显示“已登录”。
 4. 如果远程服务器环境导致回调地址落到浏览器的 `localhost:1455`，不要把 1455 暴露到公网：复制浏览器地址栏中的完整回调 URL，粘贴到控制台的“OAuth 回调地址”输入框并提交。控制台会把它转发给 CLIProxyAPI 的 `/v0/management/oauth-callback`。
-5. “刷新账号”可以查看 CLIProxyAPI 已保存的非敏感账号信息。OAuth 凭据实际保存在 `cliproxy_auths` 卷内。
+5. “刷新账号/用量快照”可以查看 CLIProxyAPI 已保存的非敏感账号信息。OAuth 凭据实际保存在 `cliproxy_auths` 卷内。
+
+账号面板的主配额百分比来自 `/auth-files` 的
+`quota.signals.X-Codex-Primary-Used-Percent`：**73% 是已用，剩余 27%**，
+不是整个订阅周期的总用量。未返回有效百分比时显示“用量未知”。
+页面可见且未进行 OAuth 登录/自检时，每 30 秒读取一次快照，也可手动刷新；
+自检完成后会重新读取账号信息。这里只读管理面记录，不主动查询上游额度，
+不额外发送生成请求；“快照读取时间”不是上游用量采样时间。
+
+账号面板的 `status/status_message` 与下方自检是两套信息：
+前者是 CLIProxyAPI 管理面的账号状态记录，后者是这一次请求的结果。
+旧页面生成后没有刷新账号面板，可能出现上方仍显示旧错误、下方已成功的情况。
+新版会刷新，但如果管理面仍报告异常，会保留告警并标明“非本次自检结果”；
+不会因为某个模型的一次调用成功，就将所有账号/模型标记为健康。
 
 如果浏览器阻止了弹窗，把按钮返回的登录地址复制到新标签页打开即可；登录状态仍由控制台轮询。
 
@@ -187,7 +200,7 @@ docker compose logs -f cli-proxy-api proxy proxy-console litellm
 ## 配置文件和持久化
 
 ```text
-docker-compose.yml                 五个服务和内部网络
+docker-compose.yml                 七个服务和内部网络
 cliproxyapi/config.yaml.template   CLIProxyAPI 基础配置（不含真实密钥）
 cliproxyapi/entrypoint.sh          启动时渲染 CLIPROXY_API_KEY
 network/proxy-console.py           节点控制台 + Codex OAuth 控制面 + 代理例外面板 + CLIProxyAPI 自检
@@ -245,6 +258,22 @@ docker compose logs -f cli-proxy-api proxy-console
 2. 标记显示「已加载 0 条」，但列表里明明有规则：点「重新应用」。若提示降级成了「整份重载配置」，当前 mihomo 版本没有单独刷新规则集的接口，配置重载会重置节点选择，请顺手确认「当前节点」。
 3. 都已加载却仍然走代理：命中的是别的规则。两个例外规则集必须排在 `rules:` 最前面，检查它们有没有被上面新增的规则挤下去。
 4. 域名只在某个容器的 `extra_hosts` 里有解析：这种情况 mihomo 解析不出来，必须把域名加进那个容器的 `NO_PROXY`（面板底部有现成的一行），再重启该容器。
+5. 点「重新应用」时弹出 `503 {"message":"open /app/mihomo/ruleset/CustomDirect.list: no such file or directory"}`（`CustomProxy.list` 同理）：mihomo 读不到这个文件。它和面板写的**不是同一个路径** —— 面板写 `RULESET_DIR`（默认 `/ruleset`，挂的是 `./network/mihomo/ruleset`），mihomo 以 `/app/mihomo` 为工作目录、按 `path: ./ruleset/CustomDirect.list` 读 `/app/mihomo/ruleset/CustomDirect.list`。两者本来指向同一份宿主机目录，出现这个错误就说明**部署机上的 proxy 容器没有该文件**，或 `proxy` / `proxy-console` 不是同一份 compose 起的（目录挂载没生效）。修复：
+
+   ```bash
+   # 1. 对比两个容器看到的目录。正常情况两边应该是同一份文件（内容、时间戳一致）
+   docker compose exec proxy-console ls -l /ruleset/
+   docker compose exec proxy ls -l /app/mihomo/ruleset/
+
+   # 2. 缺文件时，确认宿主机 network/mihomo/ruleset/ 下有这两个 .list（仓库自带），
+   #    然后重建容器让挂载和自愈逻辑生效；restart 不会重新挂载目录。
+   docker compose up -d --force-recreate proxy proxy-console
+
+   # 3. 查 mihomo 日志里是否有 ruleset 相关报错
+   docker compose logs --tail=100 proxy
+   ```
+
+   `docker-compose.yml` 里 proxy 的启动命令已经加了自愈：`mkdir -p /app/mihomo/ruleset`，两个 `.list` 不存在时创建空文件（不会覆盖已有内容）。控制台遇到 503 会降级成整份配置重载，并在重载后核对两个清单的条数；条数对不上会直接提示「两个容器看到的 ruleset 目录不是同一份」。
 
 手工改过 `.list` 文件的话注意：控制台重写文件时会保留文件开头的注释块，**规则行之后的注释会被丢弃**，所以说明统一写在文件开头。
 

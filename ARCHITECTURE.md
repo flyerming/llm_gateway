@@ -1,7 +1,7 @@
 # 方案设计说明
 
-> 本工程把 **LiteLLM**、**CLIProxyAPI**、**mihomo**、**PostgreSQL** 收敛到一套 Docker Compose 里，
-> 对外只暴露两个端口：`4000`（统一模型 API）和 `8787`（运维控制台）。
+> 本工程把 **LiteLLM**、**CLIProxyAPI**、**mihomo**、**PostgreSQL**、**SearXNG** 收敛到一套 Docker Compose 里，
+> 对外暴露两个端口：`4000`（统一模型 API，含 `/searxng/mcp` 搜索）和 `8787`（运维控制台）。
 >
 > 本文说明「为什么这么设计」和「各部件如何协作」。日常操作请看 [USAGE.md](USAGE.md)，
 > 已知问题与改进建议请看 [REVIEW.md](REVIEW.md)。
@@ -58,7 +58,8 @@
 
 - **数据面与控制面分离**。`proxy` 是真正转发业务流量的 mihomo 进程；`proxy-console` 只是网页控制面，
   自己不转发任何业务流量。控制台挂掉不影响模型调用。
-- **8317 / 7890 / 9090 全部不发布到宿主机**，只在 compose 网络内可见。外部能碰到的只有 4000 和 8787。
+- **8317 / 7890 / 9090 / 8080 / 8090 全部不发布到宿主机**，只在 compose 网络内可见。
+  外部能碰到的是 4000（含 MCP 搜索）和 8787。
 - **8787 是唯一的运维入口**，也是唯一能改代理规则的地方，权限等价于改 mihomo 配置（见第 7 节）。
 
 ---
@@ -72,13 +73,21 @@
 | `proxy-console` | `python:3.12-alpine` | **8787** | 节点/订阅/账号/例外清单的网页控制台 | `./network` 只读 + `./network/mihomo/ruleset` 可写 |
 | `litellm` | `litellm/litellm-database:v1.100.1` | **4000** | 统一 API 网关、模型与虚拟密钥管理 | `postgres_data` 卷（经 db） |
 | `db` | `postgres:16` | 无（5432 内部） | LiteLLM 的配置与用量数据库 | `postgres_data` 卷 |
+| `searxng` | `${SEARXNG_IMAGE:-searxng/searxng:latest}` | 无（8080 内部） | 元搜索引擎。只在 compose 网络里被 `searxng-mcp` 调用，**自身没有鉴权**，边界靠网络隔离 | `./searxng/settings.yml`（**可写**挂载） |
+| `searxng-mcp` | `${MCP_SEARXNG_IMAGE:-isokoliuk/mcp-searxng:latest}` | 无（8090 内部） | 把 SearXNG 包装成 MCP 工具（搜索 + 读正文）。**不发布端口**，只被 `litellm` 以容器身份调用，经网关的 `/searxng/mcp` 对客户端开放。带 bearer 鉴权与 Host/Origin 白名单 | 无状态 |
 
-依赖关系：`litellm` 等 `db` 健康后再起；`proxy-console` 和 `cli-proxy-api` 只等 `proxy` `service_started`
-（不等 healthcheck，原因见 [REVIEW.md](REVIEW.md) 中 healthcheck 一节）。
+依赖关系：`litellm` 等 `db` 健康、`cli-proxy-api` 与 `searxng-mcp` 起来后再起；
+`proxy-console` 和 `cli-proxy-api` 只等 `proxy` `service_started`
+（不等 healthcheck，原因见 [REVIEW.md](REVIEW.md) 中 healthcheck 一节）。`searxng-mcp` 等 `searxng`
+**健康**后再起；`searxng` 等 `proxy` `service_started`。
+
+> `searxng-mcp` 的 healthcheck 只探 `/health`（官方免鉴权端点，且不碰 SearXNG）。
+> **它绿了只代表 HTTP 还活着，不代表能搜**——真搜索接进去会让容器随上游波动反复重启。
+> 真实可用性验证见 [searxng/README.md](searxng/README.md) 的分层验证一节。
 
 ---
 
-## 4. 三条核心链路
+## 4. 四条核心链路
 
 ### 4.1 模型调用链路
 
@@ -137,6 +146,43 @@
 第 ② 步的兜底路径是远程部署的关键：**不要把 1455 端口映射到公网**，
 把回调 URL 手动贴回控制台即可（详见 [USAGE.md](USAGE.md)）。
 
+### 4.4 搜索链路（为什么工具在客户端侧，而鉴权在网关）
+
+```text
+客户端（codex CLI / VSCode Codex 插件 / VSCode Claude Code）
+   └─HTTP Bearer（用户自己的 LiteLLM key）──▶ litellm:4000/searxng/mcp
+                                                  └─HTTP Bearer（服务端内部凭据）──▶ searxng-mcp:8090/mcp
+                                                       └─HTTP──▶ searxng:8080/search?format=json
+                                                                     └─proxy:7890──▶ 各搜索引擎
+```
+
+**为什么工具必须在客户端侧。** 服务端无解：Codex 的 web search 与 Claude Code 的
+WebSearch 都是**托管（服务端）工具**——客户端只是把一个工具声明塞进请求的 `tools` 数组，指望上游
+执行；而网关对 `custom_openai` 自有模型会把这个声明丢掉（实测响应里 `tools` 为空）。
+LiteLLM 自带的 Search Tools（`/v1/search`）是另一套端点族，客户端根本不会去调。
+
+所以搜索被做成一个模型能主动调用的 MCP 工具。三个客户端都是 MCP 客户端，连同一个端点，
+与它们背后是什么模型无关。这也意味着**搜索的可用性不由网关的 SLA 覆盖**——
+`searxng-mcp` 挂了，模型只是没有搜索工具，对话本身不受影响。
+
+**为什么鉴权要回到网关。** 第一版是客户端直连 `searxng-mcp:8090`，代价是每个用户要多拿一个
+**全局共享、无法按用户吊销**的 `MCP_SEARXNG_TOKEN`，而且这个 token 会被明文写进客户端配置文件。
+把 `searxng-mcp` 收进 compose 内网、改由网关代理之后：
+
+- 客户端用**本来就有的 LiteLLM virtual key** 鉴权（`allow_all_keys: true`），用户手里只有一把 key；
+- `MCP_SEARXNG_TOKEN` 降级为**服务端内部凭据**，只存在于网关的注册记录里，用户看不到——
+  和 `CLIPROXY_API_KEY` 之于「litellm → cli-proxy-api」是同一个角色；
+- 8090 不再发布，所以「能被谁调用」由网关的 key 体系决定，不再依赖那层 Host 白名单兜底；
+- 搜索配置可以并进主流程，于是**一条命令**就配完模型 + 搜索。
+
+注册是一次性管理员动作（`python searxng/register_mcp.py`，幂等），记录存在 Postgres，重启不丢。
+
+上游执行者选的是开源镜像 `isokoliuk/mcp-searxng` 而不是自研适配器，理由是能力而非鉴权：
+它的 `web_url_read` 能把 URL 读成 Markdown（「搜到 → 读几篇 → 综合」是研究类任务的主路径），
+另有 `searxng_instance_info` 让模型自查实例启用了哪些 categories/engines。
+
+> 部署与**分层验证**（五层，从 SearXNG 本体到客户端）见 [searxng/README.md](searxng/README.md)。
+
 ---
 
 ## 5. 配置解析链路
@@ -181,7 +227,7 @@ remote-management:
 
 ## 6. 密钥体系
 
-五把钥匙，权限边界各不相同，**不能混用**：
+六把钥匙，权限边界各不相同，**不能混用**：
 
 | 密钥 | 存放 | 谁在用 | 权限范围 | 轮换影响 |
 | --- | --- | --- | --- | --- |
@@ -191,6 +237,18 @@ remote-management:
 | `CLIPROXY_API_KEY` | `.env` → entrypoint 渲染 | LiteLLM、控制台自检 | 只能调 `/v1/*` 数据面 | 需同时更新 CLIProxyAPI 与控制台并重启 |
 | `CLIPROXY_MANAGEMENT_KEY` | `.env` → 环境变量 | 仅控制台 | `/v0/management` 全部管理操作：登录、账号、回调 | 需更新控制台与 CLIProxyAPI 并重启 |
 | `CONSOLE_PASSWORD` | `.env` | 运维人员 | 8787 控制台（等价于改 mihomo 规则） | 随意轮换 |
+| `MCP_SEARXNG_TOKEN` | `.env` → `searxng-mcp` 环境变量 | **只有 `litellm`**（服务端内部凭据） | 只能调 **MCP 搜索端点**：搜索与读网页 | 改 `.env` → `docker compose up -d searxng-mcp` → 重跑 `register_mcp.py`。**客户端不用动** |
+| 每个用户的 LiteLLM virtual key | LiteLLM 数据库 | 用户自己 | 模型 + `/searxng/mcp`（由 `allow_all_keys: true` 放行） | 网关侧操作，与客户端配置文件无关 |
+
+`MCP_SEARXNG_TOKEN` 现在**不是**客户端密钥了——它只存在于网关的 MCP 注册记录里，用于
+「网关 → `searxng-mcp`」这一跳，用户永远看不到（详见 [4.4](#44-搜索链路为什么工具在客户端侧而鉴权在网关)）。
+轮换它**不需要**碰任何客户端：用户拿的是自己的 LiteLLM key。
+
+另有一个**不是密钥**的变量 `MCP_SEARXNG_ALLOWED_HOSTS`：用 `Host` 头**连端口精确比对**，
+所以值必须是 `searxng-mcp:8090`。用**服务名**而不是 IP，是因为网关以容器身份经 compose 网络
+来连——这也让这一项不含任何环境相关的配置，换机器、换 IP 都不用改。
+`register_mcp.py` 每次运行都会核对它与注册 URL 是否同源，不一致会报警。
+见 [searxng/README.md](searxng/README.md)。
 
 设计上做得对的地方：`CLIPROXY_MANAGEMENT_KEY` 权限高于数据面 key，控制台**从不把它回传给浏览器**
 （`network/proxy-console.py:118-153`，密钥只进请求头）；账号列表接口也只白名单抽取
@@ -276,13 +334,25 @@ mihomo 会解析失败**——这种域名必须放进该容器的 `NO_PROXY`，
 ## 9. 文件清单与持久化
 
 ```text
-docker-compose.yml                    五个服务、内部网络、日志策略
+docker-compose.yml                    七个服务、内部网络、日志策略
 .env                                  全部明文密钥（不进版本库）
 ARCHITECTURE.md / USAGE.md / REVIEW.md  本文档及配套
 
 cliproxyapi/
   config.yaml.template                CLIProxyAPI 基础配置（不含真实密钥）
   entrypoint.sh                       启动时渲染 CLIPROXY_API_KEY
+
+searxng/
+  settings.yml                        挂进容器 /etc/searxng/settings.yml（**可写**，entrypoint 要就地替换 secret_key）
+  register_mcp.py                     把 searxng-mcp 注册进 LiteLLM 网关（幂等，服务器上跑一次）
+  README.md                           部署与分层验证
+
+codexcli/                             让 Linux codex CLI 直连网关的工具包
+  private_api.py                      入口（搜索已折进主流程；另有 --configure-search / --check-search）
+  private-api/search.py               MCP 搜索配置写入与探活
+vscode/                               让 VSCode 两个插件直连网关的工具包
+  private_api.py                      入口（同上，且搜索默认写两个插件）
+  private-api/search.py               与 codexcli 那份**逐字节相同**（沿用 gateway.py 的惯例）
 
 network/
   proxy-console.py                    控制台（后端 + 内嵌前端，单文件）
@@ -332,7 +402,9 @@ network/
 
 必须在文档里说清楚的前提：
 
-1. **只发布 8787 和 4000**。7890 / 8317 / 9090 一律不映射到宿主机。
+1. **只发布 8787 和 4000**。7890 / 8317 / 9090 / 8080 / 8090 一律不映射到宿主机。
+   MCP 搜索（8090）也在这条线内——它不是对外端口，客户端经网关的 `/searxng/mcp` 进来
+   （见第 6 点）。
 2. **8787 是 Basic 鉴权 + 明文 HTTP**，没有 TLS、没有 CSRF token。
    能登进 8787 就能改代理规则、切节点、发起真实的上游生成请求——权限等价于改 mihomo 配置。
    → 设置强密码，限制防火墙来源网段，**不要暴露到公网**。
@@ -341,3 +413,13 @@ network/
 4. **`CLIPROXY_MANAGEMENT_KEY` 权限高于模型 API key**，只给控制台用，不要发给客户端。
 5. `.env`、`cliproxy_auths` 卷内的 OAuth JSON、`network/mihomo/config.yaml` 的订阅 URL、
    `network/clash/RihD9ROJzl50.yaml` 的节点凭据都是敏感信息。
+6. **`searxng` 与 `searxng-mcp` 都不发布端口**，能被谁调用完全取决于"它们只在 compose
+   网络里"这一事实。对外的入口是网关的 `/searxng/mcp`，用 LiteLLM virtual key 鉴权
+   （`allow_all_keys: true`），所以「谁能搜」现在由网关的 key 体系决定——这比第一版
+   （直连 8090 + 一个共享静态 token）更可控，因为 key 能按用户签发和吊销，而那个共享
+   token 谁都吊销不了。
+   `MCP_HTTP_ALLOWED_HOSTS` 仍是必设项：它是 `Host` 头的**连端口精确比对**，用来挡
+   DNS rebinding。值就该是 `searxng-mcp:8090`（服务名），**不要**放宽到 `0.0.0.0` 或整段内网。
+   ★ 但要注意**暴露面本身没有变小**：`web_url_read` 能抓任意 URL，等于一个出网抓取器，
+   现在「任何一个持有合法 LiteLLM key 的人」都能用它——发 key 之前要想清楚这一点。
+   门锁更好了，但门后面的东西还是那件东西。

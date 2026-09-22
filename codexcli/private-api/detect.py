@@ -194,31 +194,31 @@ class Report:
     def render(self) -> str:
         def rows(title: str, items: list) -> list[str]:
             if not items:
-                return [f"  {title}: not found"]
+                return [f"  {title}: 未找到"]
             lines = [f"  {title}:"]
             for i in items:
-                mark = "" if Path(i).exists() else "   (will be created)"
+                mark = "" if Path(i).exists() else "   （将会创建）"
                 lines.append(f"      {i}{mark}")
             return lines
 
-        lines = ["discovered:"]
-        lines += rows("codex home", [self.codex_home] if self.codex_home else [])
+        lines = ["检测结果："]
+        lines += rows("codex 主目录", [self.codex_home] if self.codex_home else [])
         lines += rows("codex config.toml", [self.codex_config] if self.codex_config else [])
         lines += rows("codex auth.json", [self.codex_auth] if self.codex_auth else [])
         lines += rows("codex models_cache.json",
                       [self.codex_models_cache] if self.codex_models_cache else [])
-        lines += rows("codex binary", [self.codex_binary] if self.codex_binary else [])
+        lines += rows("codex 可执行文件", [self.codex_binary] if self.codex_binary else [])
         if self.codex_version:
-            lines.append(f"      version: {self.codex_version}")
+            lines.append(f"      版本：{self.codex_version}")
             # Local import: codex.py reaches back into this module for
             # codex_home(), so a top-level import here would be a cycle.
             import codex
-            ok, note = codex.version_note(self.codex_version)
-            lines.append(f"      {'' if ok else '! '}{note}")
+            ok, verdict = codex.version_note(self.codex_version)
+            lines.append(f"      {'' if ok else '! '}{verdict}")
         if self.wrapper:
-            lines.append(f"  codex wrapper: {self.wrapper}")
+            lines.append(f"  codex 包装脚本：{self.wrapper}")
         env = os.environ.get("CODEX_HOME")
-        lines.append(f"  CODEX_HOME env: {env if env else '(unset -- using ~/.codex)'}")
+        lines.append(f"  CODEX_HOME 环境变量：{env if env else '（未设置 —— 使用 ~/.codex）'}")
         return "\n".join(lines)
 
 

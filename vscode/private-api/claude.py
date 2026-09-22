@@ -134,10 +134,10 @@ def _short_tokens(n: object) -> str:
 def picker_description(model: Model) -> str:
     """The grey subtitle under a /model row. LiteLLM gives us no description."""
     raw = model.raw or {}
-    bits = ["From gateway"]
+    bits = ["来自网关"]
     ctx = _short_tokens(raw.get("max_input_tokens"))
     if ctx:
-        bits.append(f"{ctx} context")
+        bits.append(f"{ctx} 上下文")
     return " · ".join(bits)
 
 

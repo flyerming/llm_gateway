@@ -2,7 +2,7 @@
 
 set -eu
 
-RELEASE="${CODEX_RELEASE:-latest}"
+RELEASE="${CODEX_RELEASE:-0.154.0}"
 NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="true"
 PREFER_RELEASES_OPENAI_COM="${CODEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
@@ -84,7 +84,7 @@ parse_args() {
 Usage: install.sh [--release VERSION]
 
 Environment:
-  CODEX_RELEASE          Version to install; overridden by --release.
+  CODEX_RELEASE          Version to install; overridden by --release.  Default: 0.154.0.
   CODEX_NON_INTERACTIVE  Set to 1, true, or yes to skip prompts.
   CODEX_INSTALLER_USE_RELEASES_OPENAI_COM
                          Set to 0, false, or no to use GitHub Releases.

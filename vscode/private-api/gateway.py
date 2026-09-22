@@ -57,7 +57,7 @@ def _request(url: str, api_key: str, *, method: str = "GET", body: dict | None =
     except urllib.error.HTTPError as e:
         return e.code, e.read()
     except Exception as e:  # noqa: BLE001 - surface the raw cause to the user
-        raise GatewayError(f"{type(e).__name__}: {e}\n  while calling {url}") from e
+        raise GatewayError(f"{type(e).__name__}: {e}\n  调用 {url} 时出错") from e
 
 
 @dataclass
@@ -87,13 +87,13 @@ def list_models(base: str, api_key: str, *, timeout: float = 30.0) -> list[Model
     if status != 200:
         snippet = body[:400].decode(errors="replace")
         raise GatewayError(
-            f"gateway returned HTTP {status} for {url}\n  {snippet}\n"
-            "  -> check --api-base and --api-key"
+            f"网关对 {url} 返回 HTTP {status}\n  {snippet}\n"
+            "  -> 请检查 --api-base 和 --api-key"
         )
     try:
         payload = json.loads(body.decode("utf-8"))
     except ValueError as e:
-        raise GatewayError(f"{url} did not return JSON: {e}") from e
+        raise GatewayError(f"{url} 没有返回 JSON：{e}") from e
 
     data = payload.get("data", payload if isinstance(payload, list) else [])
     models: list[Model] = []

@@ -1,4 +1,4 @@
-# LiteLLM 网关 + CLIProxyAPI + Postgres + mihomo 代理 + 节点可视化控制台
+# LiteLLM 网关 + CLIProxyAPI + Postgres + mihomo 代理 + 节点可视化控制台 + SearXNG 搜索
 #
 # 所有服务都在同一个 compose 网络里，互相用服务名访问：
 #   CLIProxyAPI --proxy-url--> proxy:7890       (Codex/OpenAI OAuth 上游)
@@ -7,9 +7,20 @@
 #   console     --CLIProxy-> cli-proxy-api:8317 (统一登录和账号状态)
 #   console     --文件-----> network/mihomo/ruleset (代理例外清单，网页可改)
 #   litellm     --DATABASE-> db:5432
+#   searxng     --proxy----> proxy:7890        (搜索引擎上游，和 OAuth 同一条链路)
+#   searxng-mcp --HTTP-----> searxng:8080      (JSON API，format=json)
+#   litellm     --MCP------> searxng-mcp:8090  (MCP 网关，三个客户端都经这里搜)
 #
-# 对外只发布 8787（节点/登录控制台）和 4000（LiteLLM）。
-# 7890、8317、9090 只在 compose 网络内可见。
+# 对外只发布 8787（节点/登录控制台）和 4000（统一入口：LiteLLM +
+# /deepseek-harness/）。7890、8317、9090、3080、8080、8090 只在 compose 网络内可见。
+#
+# 为什么会有 SearXNG 这一组：Codex 的 web search 是「托管工具」——它只是把
+# {"type":"web_search"} 塞进 Responses API 的 tools 数组，由上游去执行；网关对
+# custom_openai 自有模型会把这个工具直接丢掉（实测响应里 tools 是空的），所以
+# 服务端没有开关可配。Claude Code 自带的 WebSearch 同理，也是服务端工具。唯一
+# 的出路是把搜索放到客户端侧做成一个模型能调用的工具，也就是 MCP。三个客户端
+# （Linux codex CLI、VSCode Codex 插件、VSCode Claude Code）都是 MCP 客户端，
+# 连同一个地址即可，与它们背后是什么模型无关。
 
 x-logging: &default-logging
   driver: json-file
@@ -31,6 +42,13 @@ services:
       - -c
       - |
         chmod +x /app/mihomo-linux-amd64 2>/dev/null || true
+        # 自愈：rule-provider 是 type: file，文件不存在时 mihomo 刷新会返回 503
+        # （open /app/mihomo/ruleset/CustomDirect.list: no such file or directory）。
+        # 列出的是配置里声明的两个本地例外清单；已存在就保留内容，绝不覆盖。
+        mkdir -p /app/mihomo/ruleset
+        for f in CustomDirect.list CustomProxy.list; do
+          [ -e "/app/mihomo/ruleset/$f" ] || : > "/app/mihomo/ruleset/$f"
+        done
         exec /app/mihomo-linux-amd64 -d /app/mihomo
     healthcheck:
       # 某些 Alpine/busybox 版本的 wget 参数不同；若持续 unhealthy，可按 README 删除本段。
@@ -100,12 +118,127 @@ services:
     command: ["python", "/app/proxy-console.py"]
     logging: *default-logging
 
+  # SearXNG 搜索后端。只在 compose 网络里被 searxng-mcp 调用，不发布端口：
+  # 它没有鉴权，能被谁调用完全靠网络边界。要临时用浏览器看效果，用
+  # `docker compose exec searxng wget -qO- 'http://127.0.0.1:8080/search?q=test'`，
+  # 或者按需临时加一行端口映射。
+  searxng:
+    # 上游镜像的 tag 变动频繁，默认 latest，要固定版本就在 .env 里设 SEARXNG_IMAGE。
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_started
+    environment:
+      # 只有这一个变量会被消费：entrypoint 拿它替换 settings.yml 里
+      # `ultrasecretkey` 那个字面量。
+      # ⚠️ 代理地址**不在这里配**：settings.yml 是用不带自定义 constructor 的
+      #    yaml.safe_load 读的，引用不了环境变量（`!ENV` 会让容器启动时崩溃）。
+      #    改代理请直接改 searxng/settings.yml 的 outgoing.proxies。
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+      TZ: Asia/Shanghai
+    volumes:
+      # 故意不用 :ro —— entrypoint 发现 secret_key 还是 `ultrasecretkey` 时会用
+      # SEARXNG_SECRET 替换它，只读挂载会让那一步失败。
+      # ⚠️ 替换是「就地改写」还是「写去别处」尚未在真实镜像上确认：如果它直接改这个
+      #    挂载文件，那真实 secret 会落到宿主机上这个文件里，而 `searxng/` 是新增目录、
+      #    下一次 `git add` 就会带上它。所以：**先用占位值提交，再启动容器**，
+      #    之后用 `git status --short searxng/settings.yml` 判定。详见 searxng/README.md。
+      - ./searxng/settings.yml:/etc/searxng/settings.yml
+    expose:
+      - "8080"
+    # 官方 docker 部署推荐的最小权限集：entrypoint 以 root 起手 chown，再切到
+    # searxng 用户，所以只留这三个 capability。
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      # 只探进程活着，不探搜索是否可用：搜索依赖外部引擎和代理节点，波动很大，
+      # 把它接进 healthcheck 只会让容器反复重启。
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+  # SearXNG 的 MCP 适配层：把搜索和读正文包装成 MCP 工具，三个客户端统一连这里。
+  #
+  # 用上游开源镜像 isokoliuk/mcp-searxng，不是自己写的。选它的原因不是鉴权，是
+  # 能力：除了 searxng_web_search，它还有 web_url_read（把 URL 读成 Markdown/
+  # 文本，支持标题层级和有界 PDF 抽取）、searxng_instance_info（查实例有哪些
+  # categories/engines，模型用错分类名时能自查）和 searxng_search_suggestions。
+  # 「搜到→读正文」是研究类任务的主路径，缺了读这一半，搜索的价值大打折扣。
+  # 另外它自带多实例故障转移、缓存、限流和 Cosign 签名镜像。
+  searxng-mcp:
+    image: ${MCP_SEARXNG_IMAGE:-isokoliuk/mcp-searxng:latest}
+    restart: unless-stopped
+    depends_on:
+      searxng:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      # 设了 MCP_HTTP_PORT 才启用 HTTP 传输（否则是 stdio）。
+      MCP_HTTP_PORT: "8090"
+      # 默认只绑 127.0.0.1，容器里必须显式放开。
+      MCP_HTTP_HOST: 0.0.0.0
+
+      # ---- 鉴权与网络边界 ----
+      # 这个端口发布到局域网，必须开鉴权。MCP_HTTP_HARDEN / AUTH_TOKEN /
+      # ALLOWED_ORIGINS 三者要同时配，缺一个启动就报错。
+      MCP_HTTP_HARDEN: "true"
+      MCP_HTTP_AUTH_TOKEN: ${MCP_SEARXNG_TOKEN:?请在 .env 里设置 MCP_SEARXNG_TOKEN}
+      # ★ 这是个容易踩的坑：ALLOWED_HOSTS 默认只有 127.0.0.1/localhost/[::1]，
+      #   而且是拿它跟请求的 Host 头**连端口精确比对**的。不匹配就是 403，而
+      #   /health 仍然是绿的（它不受这层限制）—— 症状会指向 token，指错方向。
+      #   所以 register_mcp.py 每次都会核对这一项和它要用的 URL 是否同源。
+      #
+      # ★ 这里用**服务名**而不是宿主机 IP：LiteLLM 是以容器身份经 compose 网络
+      #   来连的，Host 头就是 searxng-mcp:8090。用服务名的好处是这一项不含任何
+      #   环境相关的配置 —— 换机器、换 IP、换环境都不用改。
+      #   只有当客户端还需要直连 8090 时（过渡期），才在 .env 里覆盖成
+      #   `searxng-mcp:8090,<宿主IP>:8090` 两者都收。
+      MCP_HTTP_ALLOWED_HOSTS: ${MCP_SEARXNG_ALLOWED_HOSTS:-searxng-mcp:8090}
+      # 我们的三个客户端都是非浏览器 MCP 客户端，不带 Origin 头，而「缺失
+      # Origin」在任何模式下都是合法的。这一项只是为了满足「加固模式必须显式
+      # 配置」的要求；将来若真用浏览器调试，再把浏览器 origin 加进来。
+      MCP_HTTP_ALLOWED_ORIGINS: ${MCP_SEARXNG_ALLOWED_ORIGINS:-http://searxng-mcp:8090}
+      # 没有反向代理，客户端直连，所以不设 MCP_HTTP_TRUST_PROXY（设错会让
+      # 客户端伪造 X-Forwarded-For 绕过按 IP 的配额）。
+
+      # web_url_read 抓外部网页要出网，走 mihomo；到 searxng 的容器内直连。
+      HTTP_PROXY: http://proxy:7890
+      HTTPS_PROXY: http://proxy:7890
+      NO_PROXY: localhost,127.0.0.1,searxng,proxy
+      TZ: Asia/Shanghai
+    expose:
+      # ★ 故意**不**发布到宿主机。客户端不再直连这里，而是经 LiteLLM 网关的
+      #   /searxng/mcp 进来（用它们本来就有的 LiteLLM virtual key 鉴权）。
+      #   这正是「每用户只需要一把 key」的关键：端口不对外，MCP_SEARXNG_TOKEN
+      #   就降级成服务端内部凭据（网关→searxng-mcp 那一跳用），用户永远看不到。
+      #   过渡期若要保留直连，在 .env 里临时加回 ports 对应的映射。
+      - "8090"
+    healthcheck:
+      # /health 是官方明确说明的免鉴权端点，也不会去碰 SearXNG —— 所以它绿
+      # 只代表 HTTP 还活着，不代表能搜。真正的搜索验证要在服务器上手动跑
+      # （见 searxng/README.md）。
+      # 用 node 而不是 wget/curl：镜像里保证有 Node 运行时，但有没有 wget 不保证。
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:8090/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
   # LiteLLM 对外提供统一 API；模型的 base_url/key 指向 cli-proxy-api（见 README）。
   litellm:
     image: litellm/litellm-database:v1.100.1
     restart: unless-stopped
-    ports:
-      - "4000:4000"
+    expose:
+      - "4000"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?请在 .env 里设置 LITELLM_MASTER_KEY}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?请在 .env 里设置 LITELLM_SALT_KEY}
@@ -125,10 +258,83 @@ services:
         condition: service_healthy
       cli-proxy-api:
         condition: service_started
+      # MCP 搜索后端：网关要代理它的 /searxng/mcp。用 service_started 而不是
+      # service_healthy —— searxng-mcp 的 healthcheck 绿只代表 HTTP 活着，不代表
+      # 能搜，卡在 healthy 上只会拖慢启动。
+      searxng-mcp:
+        condition: service_started
     # 以下配置在云端，与内网服务器做内网穿透的时候需要配置
     # extra_hosts:
     #   - "aix-backup.hismarttv.com:host-gateway"
     # 156服务器上，通过docker compose启动需要添加如下
+    logging: *default-logging
+
+  # DeepSeek Harness 多用户 Agent 服务。
+  #
+  # Dockerfile 会从官方 DSH_TAG 重新 clone 源码；
+  # 不会使用或修改宿主机上的源码 checkout。
+  # 容器内 Nginx 监听 3080，用户首次认证时 provisioner 才会为其启动
+  # 一个只监听 127.0.0.1 的 DSH 进程和独立 workspace。
+  deepseek-harness:
+    build:
+      context: ./deepseek-harness
+      dockerfile: Dockerfile
+      args:
+        DSH_REPO: ${DSH_REPO:-https://github.com/deepseek-ai/deepseek-harness.git}
+        DSH_TAG: ${DSH_TAG:-dsh-v0.1.5-rc.2}
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_started
+    expose:
+      - "3080"
+    environment:
+      # 初次部署建议显式设置专用值；未设置时仅为兼容现有 .env，
+      # 临时回退到控制台账号和控制台密码。
+      DSH_BOOTSTRAP_USER: ${DSH_BOOTSTRAP_USER:-admin}
+      DSH_BOOTSTRAP_PASSWORD: ${DSH_BOOTSTRAP_PASSWORD:-${CONSOLE_PASSWORD:?请在 .env 里设置 CONSOLE_PASSWORD 或 DSH_BOOTSTRAP_PASSWORD}}
+      # 不在容器级注入模型密钥：每个用户在网页的“设置 → 模型”里保存自己的
+      # LiteLLM virtual key，落到各自独立的 DSH_HOME/.credentials.yaml。
+      DSH_DEFAULT_MODEL_IDS: ${DSH_DEFAULT_MODEL_IDS:-deepseek-v4.1-flash,glm-5.3-flash,qwen3-5-397b}
+      TZ: Asia/Shanghai
+    volumes:
+      - dsh_data:/data
+      - dsh_workspaces:/workspaces
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: 8g
+    healthcheck:
+      # 未认证请求预期为 401；它同时证明 Nginx 已经监听。
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ | grep -qx 401"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+  # 统一宿主机 4000 入口：
+  #   /deepseek-harness/ -> DSH
+  #   其他路径          -> LiteLLM
+  # 这样不再额外发布宿主机 3080。
+  gateway-edge:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_started
+      deepseek-harness:
+        condition: service_started
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./deepseek-harness/gateway-nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     logging: *default-logging
 
   db:
@@ -152,3 +358,5 @@ volumes:
   cliproxy_auths:
   cliproxy_logs:
   cliproxy_plugins:
+  dsh_data:
+  dsh_workspaces:

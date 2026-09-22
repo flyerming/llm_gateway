@@ -62,7 +62,7 @@ _PATCHED = re.compile(rb"/\.\*\|+/[a-z]*")
 def _replacement(group: bytes) -> bytes:
     """An always-matching regex body of exactly the same length as `group`."""
     if len(group) < 2:
-        raise ValueError("regex group too short to neutralise losslessly")
+        raise ValueError("正则匹配组太短，无法无损地失效化")
     return b".*" + b"|" * (len(group) - 2)
 
 
@@ -114,16 +114,16 @@ def build_patched(src: Path) -> tuple[Path, int, int]:
     n = len(_TARGET.findall(data))
     if n == 0:
         raise SystemExit(
-            "No `/(claude|anthropic)/i` filter found in this binary.\n"
-            "Either it is already patched, or the upstream bundle changed shape --\n"
-            "check what `claude_patch.py --check` reports and inspect the binary."
+            "在这个二进制里找不到 `/(claude|anthropic)/i` 过滤规则。\n"
+            "要么它已经打过补丁，要么上游打包结构变了 ——\n"
+            "看看 `claude_patch.py --check` 的报告，并检查该二进制。"
         )
 
     patched = _TARGET.sub(lambda m: b"/" + _replacement(m.group(1)) + b"/" + m.group(2), data)
     if len(patched) != len(data):
         raise SystemExit(
-            f"internal error: patch changed the file size ({len(data)} -> {len(patched)}).\n"
-            "Refusing to write -- Bun would fail to load the bundle."
+            f"内部错误：补丁改变了文件大小（{len(data)} -> {len(patched)}）。\n"
+            "拒绝写入 —— 否则 Bun 将无法加载该 bundle。"
         )
 
     out = src.with_suffix(src.suffix + ".patched")
@@ -161,37 +161,37 @@ def write_swap_scripts(src: Path) -> tuple[Path, Path]:
     restore_bat = d / "restore_claude_binary.bat"
 
     swap.write_text(
-        "@echo off\r\nsetlocal\r\n"
+        "@echo off\r\nchcp 65001 >nul\r\nsetlocal\r\n"
         f'set "BIN={src}"\r\n'
         f'set "PATCHED={src}.patched"\r\n'
         f'set "BAK={src}.bak"\r\n'
         'tasklist /FI "IMAGENAME eq claude.exe" 2>nul | find /I "claude.exe" >nul\r\n'
         "if not errorlevel 1 (\r\n"
-        "    echo ERROR: claude.exe is still running.\r\n"
-        "    echo Quit VSCode COMPLETELY, then run this again.\r\n"
+        "    echo 错误：claude.exe 仍在运行。\r\n"
+        "    echo 请完全退出 VSCode，然后重新运行本脚本。\r\n"
         "    pause & exit /b 1\r\n)\r\n"
-        'if not exist "%PATCHED%" ( echo ERROR: %PATCHED% missing. & pause & exit /b 1 )\r\n'
+        'if not exist "%PATCHED%" ( echo 错误：缺少 %PATCHED%。 & pause & exit /b 1 )\r\n'
         'if not exist "%BAK%" (\r\n'
-        "    echo Backing up original -^> claude.exe.bak\r\n"
-        '    copy /Y "%BIN%" "%BAK%" >nul || ( echo ERROR: backup failed. & pause & exit /b 1 )\r\n'
+        "    echo 正在备份原始文件 -^> claude.exe.bak\r\n"
+        '    copy /Y "%BIN%" "%BAK%" >nul || ( echo 错误：备份失败。 & pause & exit /b 1 )\r\n'
         ")\r\n"
-        'move /Y "%PATCHED%" "%BIN%" >nul || ( echo ERROR: swap failed. & pause & exit /b 1 )\r\n'
-        "echo Done. Reopen VSCode.\r\npause\r\n",
+        'move /Y "%PATCHED%" "%BIN%" >nul || ( echo 错误：替换失败。 & pause & exit /b 1 )\r\n'
+        "echo 完成。请重新打开 VSCode。\r\npause\r\n",
         encoding="utf-8",
     )
 
     restore_bat.write_text(
-        "@echo off\r\nsetlocal\r\n"
+        "@echo off\r\nchcp 65001 >nul\r\nsetlocal\r\n"
         f'set "BIN={src}"\r\n'
         f'set "BAK={src}.bak"\r\n'
         'tasklist /FI "IMAGENAME eq claude.exe" 2>nul | find /I "claude.exe" >nul\r\n'
         "if not errorlevel 1 (\r\n"
-        "    echo ERROR: claude.exe is still running.\r\n"
-        "    echo Quit VSCode COMPLETELY, then run this again.\r\n"
+        "    echo 错误：claude.exe 仍在运行。\r\n"
+        "    echo 请完全退出 VSCode，然后重新运行本脚本。\r\n"
         "    pause & exit /b 1\r\n)\r\n"
-        'if not exist "%BAK%" ( echo ERROR: backup not found. & pause & exit /b 1 )\r\n'
-        'copy /Y "%BAK%" "%BIN%" >nul || ( echo ERROR: restore failed. & pause & exit /b 1 )\r\n'
-        'del /Q "%BAK%"\r\necho Original restored.\r\npause\r\n',
+        'if not exist "%BAK%" ( echo 错误：找不到备份文件。 & pause & exit /b 1 )\r\n'
+        'copy /Y "%BAK%" "%BIN%" >nul || ( echo 错误：恢复失败。 & pause & exit /b 1 )\r\n'
+        'del /Q "%BAK%"\r\necho 已恢复原始文件。\r\npause\r\n',
         encoding="utf-8",
     )
     return swap, restore_bat

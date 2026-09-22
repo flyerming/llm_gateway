@@ -1,0 +1,78 @@
+// 模型能力的「实测知识库」—— 生成 model-config.jsonc 时以它为起点。
+//
+// 两个工具包各带一份、逐字节相同（沿用 gateway.py / search.py 的约定）。它不是
+// 运行时读的配置文件，用户也不该改它：真正生效的是 $CODEX_HOME/model-config.jsonc，
+// 由 `--refresh-models` / 首次安装按这份 seed ⊕ 网关实时模型列表生成。
+//
+// 这份文件存在的意义：把「哪个模型能看图」这类结论从 Python 源码搬到**数据**里。
+// 之前它们写在 modalities.py 的 MEASURED_MODALITIES 里，网关把
+// deepseek-v4.1-flash-test 改名成 deepseek-v4.1-flash 之后没人重测，新 slug 就落进
+// 默认的 ("text",)，Codex 在客户端静默拒掉贴图 —— 新老用户一律中招，修还得改源码
+// 重新发包。改成数据后，改的是这一份文件。
+//
+// ★ 网关改模型 id 就是一次**重测**，不是 find-and-replace。表按网关实际 serve 的
+//   slug 记；`--probe-modalities` 会给出结论。
+{
+  "_version": 1,
+
+  // 没有单独实测结论的模型套用这里。这也是命令行建议值的来源。
+  "_defaults": {
+    // 窄的那一边：错的「能」会让请求带着图发出去、由上游失败或者模型对着图胡说，
+    // 错的「不能」只让用户多改一行。所以默认不支持图片。
+    "input_modalities": ["text"],
+    // 网关报 max_input_tokens 就用它，没报就用这个。128K 是编码模型的安全下限：
+    // 少报会让 Codex 提前压缩，多报会让它发出后端必拒的超长请求。
+    "context_window": 128000,
+    // 私有（custom_openai）模型的三档。设计需求定的就是三档 —— 见 reasoning.py，
+    // 严格那个后端其实还接受 xhigh（在 max 之下），需要时用
+    // `--reasoning-levels xhigh` 单独开。
+    "reasoning_levels": ["low", "high", "max"],
+    "default_reasoning_level": "high"
+  },
+
+  // 某个工具包的默认值和上面不同时写在这里。目前只有 vscode 需要：
+  // 它的 webview 画不出 `max` 一行（会显示 Light/High 然后静默丢掉更高档），
+  // 所以它停在 xhigh。共用一份 _defaults 会让它拿到一个画不出来的档位 ——
+  // 这不是洁癖，是那个显示 bug 的成因。codexcli 的 CLI 没有这个限制。
+  "_toolkits": {
+    "vscode": {
+      "reasoning_levels": ["low", "high", "xhigh"]
+    }
+  },
+
+  // ── 以下是逐个模型实测出来的结论 ──
+  // `_note` 只是给生成的文件当行内注释用，不参与解析（`_` 开头的键都保留）。
+
+  // 上游直接拒图：发了就是 HTTP 400 "Model only supports text input; received
+  // unsupported content type 'image_url'"，每一轮都炸。别开。
+  "deepseek-v4-flash": {
+    "_note": "实测：上游直接 400 拒图，不要开贴图",
+    "input_modalities": ["text"]
+  },
+
+  // 2026-09-16 首次以 `deepseek-v4.1-flash-test` 测出能看图；网关随后改名成现在
+  // 这个 slug，2026-09-17 用新 slug 重测：发纯红/纯蓝两张 PNG，答 Red / Blue ——
+  // 仍能看图。
+  "deepseek-v4.1-flash": {
+    "_note": "实测 2026-09-17：能分辨红/蓝，可开贴图",
+    "input_modalities": ["text", "image"]
+  },
+
+  "glm-5.3-flash": {
+    "_note": "实测：能分辨红/蓝，可开贴图",
+    "input_modalities": ["text", "image"]
+  },
+
+  "qwen3-5-397b": {
+    "_note": "实测：能分辨红/蓝，可开贴图",
+    "input_modalities": ["text", "image"]
+  },
+
+  // 最需要写下来的一条：它**收得下**图并返回 200，但没在看。一次对纯红答 "Black"、
+  // 对纯蓝答 "Orange"，另一次直接拒答 "I am unable to determine"。没有报错可察觉，
+  // 所以只能靠实测关掉 —— 这也正是这张表要存在的原因。
+  "xinghai-ultra": {
+    "_note": "实测：收得下但看不见（对纯红答 Black），不要开贴图",
+    "input_modalities": ["text"]
+  }
+}

@@ -35,6 +35,7 @@ import base64
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import sys
@@ -113,6 +114,33 @@ class RuleError(Exception):
     def __init__(self, message, status=400):
         super().__init__(message)
         self.status = status
+
+
+def http_error_detail(exc, limit=500):
+    """尽量从 HTTPError 的响应体里取出可读的错误说明。
+
+    mihomo 的 503 会把真正的失败原因放在 `{"message": "..."}` 里，例如
+    `open /app/mihomo/ruleset/CustomDirect.list: no such file or directory`。
+    只留状态码等于把最有用的信息丢掉，页面上就只剩一个看不懂的 503。
+    """
+    try:
+        raw = exc.read()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("message", "error", "msg", "detail", "reason"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+    return " ".join(text.split())[:limit]
 
 
 def cliproxy(method, path, body=None, timeout=15, auth=True):
@@ -210,7 +238,7 @@ def _account_summary(item):
     for key in ("disabled", "unavailable"):
         if isinstance(item.get(key), bool):
             safe[key] = item[key]
-    # 最近一次失败的上游原文，截断后再给浏览器。
+    # 管理面记录的异常，不是本次自检响应；不能仅凭它判断当前请求失败。
     message = item.get("status_message")
     if isinstance(message, str) and message:
         safe["status_message"] = message[:300]
@@ -232,9 +260,12 @@ def _account_summary(item):
         used = quota["signals"].get("X-Codex-Primary-Used-Percent")
         if used is not None:
             try:
-                safe["used_percent"] = int(used)
+                used_percent = float(used)
+                if not isinstance(used, bool) and math.isfinite(used_percent) and 0 <= used_percent <= 100:
+                    safe["used_percent"] = used_percent
+                    safe["remaining_percent"] = round(100 - used_percent, 2)
             except (TypeError, ValueError):
-                safe["used_percent"] = used
+                pass
     return safe
 
 
@@ -501,9 +532,13 @@ def mihomo(method, path, body=None, timeout=10):
             raw = response.read()
     except urllib.error.HTTPError as exc:
         # 404 通常是接口不存在（mihomo 版本差异），交给调用方降级处理。
-        raise MihomoError(
-            "mihomo returned HTTP %d for %s" % (exc.code, path), status=exc.code
-        )
+        # 其余状态码把响应体里的 message 带出来：503 的真实原因（例如规则
+        # 文件不存在）只写在 body 里，丢掉它页面上就只剩一个看不懂的 503。
+        detail = http_error_detail(exc)
+        message = "mihomo 返回 HTTP %d（%s）" % (exc.code, path)
+        if detail:
+            message += "：%s" % detail
+        raise MihomoError(message, status=exc.code)
     except urllib.error.URLError as exc:
         raise MihomoError("cannot reach mihomo at %s: %s" % (CONTROLLER, exc.reason))
     except OSError as exc:
@@ -873,9 +908,15 @@ def apply_ruleset():
     优先只刷新 rule-provider：不重建连接，正在跑的请求不受影响。当前 mihomo
     版本没有这个接口（404）时，降级为整份配置重载 —— 那条路会重置节点选择，
     所以必须在页面上说清楚。
+
+    503 也走降级重载：mihomo 刷新单条 provider 时如果读不到文件（例如
+    `open /app/mihomo/ruleset/CustomDirect.list: no such file or directory`），
+    返回的就是 503。情况可能是容器看到的目录不一致，也可能是文件刚被删掉；
+    整份重载会强制执行一次完整校验，失败时把真实原因一起报给页面。
     """
-    result = {"providers": {}, "reloaded_config": False, "errors": []}
+    result = {"providers": {}, "reloaded_config": False, "errors": [], "notes": []}
     fallback_needed = False
+    fallback_reasons = []
 
     for which, meta in RULESETS.items():
         path = "/providers/rules/" + urllib.parse.quote(meta["provider"], safe="")
@@ -883,9 +924,15 @@ def apply_ruleset():
             mihomo("PUT", path, timeout=20)
             result["providers"][which] = "reloaded"
         except MihomoError as exc:
-            if exc.status == 404:
+            if exc.status in (404, 503):
                 fallback_needed = True
                 result["providers"][which] = "fallback"
+                if exc.status == 503:
+                    fallback_reasons.append(str(exc))
+                    result["notes"].append(
+                        "mihomo 单独刷新「%s」失败，已改用整份配置重载：%s"
+                        % (meta["label"], exc)
+                    )
             else:
                 result["providers"][which] = "error"
                 result["errors"].append("%s：%s" % (meta["label"], exc))
@@ -900,9 +947,54 @@ def apply_ruleset():
             )
             result["reloaded_config"] = True
         except MihomoError as exc:
-            result["errors"].append("整份配置重载失败：%s" % exc)
+            detail = "；".join([str(exc)] + fallback_reasons)
+            result["errors"].append(
+                "整份配置重载失败：%s。常见原因是 proxy 容器里的 "
+                "/app/mihomo/ruleset 没有这两个 .list 文件，请检查 proxy 与 "
+                "proxy-console 是否来自同一份 compose，并执行 "
+                "`docker compose up -d --force-recreate proxy proxy-console`。"
+                % detail
+            )
 
+    result["errors"].extend(verify_ruleset_counts())
     return result
+
+
+def verify_ruleset_counts():
+    """核对 mihomo 实际读到的规则条数是否和本地清单一致。
+
+    这是唯一能发现「两个容器看到的 ruleset 不是同一个目录」的办法：控制台
+    写文件一定成功（它写自己的挂载），但 mihomo 可能读的是另一个路径。条数
+    对不上就说明两边不是同一份文件，页面必须明确告诉用户，而不是假报成功。
+    """
+    payload = ruleset_providers()
+    if not payload.get("supported"):
+        return []
+
+    errors = []
+    for which, meta in RULESETS.items():
+        try:
+            expected = len(read_ruleset(which))
+        except RuleError:
+            continue
+        info = payload["providers"].get(which) or {}
+        if not info.get("present"):
+            errors.append(
+                "「%s」在 mihomo 里没有加载（provider %s 不存在）。"
+                "检查 network/mihomo/config.yaml 的 rule-providers，并重建 proxy。"
+                % (meta["label"], meta["provider"])
+            )
+            continue
+        actual = info.get("rule_count")
+        if isinstance(actual, int) and actual != expected:
+            errors.append(
+                "「%s」本地清单 %d 条，mihomo 实际读到 %d 条：两个容器看到的 "
+                "ruleset 目录不是同一份。请在部署机上执行 "
+                "`docker compose up -d --force-recreate proxy proxy-console`"
+                "（restart 不会重新挂载目录）。"
+                % (meta["label"], expected, actual)
+            )
+    return errors
 
 
 def ruleset_providers():
@@ -1179,9 +1271,12 @@ PAGE = """<!DOCTYPE html>
       <span class="name" id="codexStatus">未登录</span>
     </div>
     <div class="meta" id="codexAccounts" style="margin-top:8px">正在读取 CLIProxyAPI 账号…</div>
+    <div class="meta" id="codexAccountsUpdated" style="margin-top:6px">
+      每 30 秒读取账号快照；用量来自 CLIProxyAPI 记录，并非主动向上游查询实时额度。
+    </div>
     <div class="row" style="margin-top:12px">
       <button class="primary" id="codexLogin">登录 Codex</button>
-      <button id="codexRefresh">刷新账号</button>
+      <button id="codexRefresh">刷新账号/用量快照</button>
     </div>
     <div style="margin-top:12px">
       <label for="codexCallback">OAuth 回调地址（远程服务器登录时，把浏览器地址栏完整 URL 粘贴到这里）</label>
@@ -1414,30 +1509,67 @@ function codexLabel(f) {
 }
 
 function codexHealth(f) {
-  // 依据 /auth-files 的真实字段推导单个账号的状态档位。
+  // 管理面快照与本次自检独立；保留告警，不用单次成功覆盖所有账号。
   if (f.disabled) return { rank: 4, text: '已禁用', cls: 'd-bad' };
   if (f.subscription_until && Date.parse(f.subscription_until) < Date.now()) {
     return { rank: 3, text: '订阅过期', cls: 'd-bad' };
   }
-  if (f.status === 'error') return { rank: 2, text: '已登录·最近请求异常', cls: 'd-warn' };
-  return { rank: 1, text: '已登录·正常', cls: 'd-good' };
+  if (f.status === 'error' || f.unavailable) {
+    return { rank: 2, text: '凭据已保存·管理面有异常记录', cls: 'd-warn' };
+  }
+  return { rank: 1, text: '凭据已保存·管理面未报告异常', cls: 'd-good' };
 }
 
 function codexDetail(f) {
   const parts = [codexLabel(f)];
   if (f.plan) parts.push(f.plan);
   if (f.subscription_until) parts.push('订阅至 ' + String(f.subscription_until).slice(0, 10));
-  if (f.used_percent !== undefined && f.used_percent !== null) parts.push('用量 ' + f.used_percent + '%');
+  if (f.used_percent !== undefined && f.used_percent !== null) {
+    const remaining = f.remaining_percent !== undefined && f.remaining_percent !== null
+      ? f.remaining_percent
+      : Math.max(0, 100 - Number(f.used_percent));
+    parts.push('主配额已用 ' + f.used_percent + '%（剩余 ' + remaining + '%）');
+  } else {
+    parts.push('主配额用量未知');
+  }
   parts.push(codexHealth(f).text);
   let line = parts.join(' · ');
   if (Array.isArray(f.models) && f.models.length) line += '　模型：' + f.models.join('、');
-  if (f.status === 'error' && f.status_message) line += '　上游：' + f.status_message;
+  if (f.status === 'error' && f.status_message) {
+    line += '　管理面记录的上游错误（非本次自检结果）：' + f.status_message;
+  }
   return line;
+}
+
+let codexAccountsRefreshBusy = false;
+
+async function refreshCodexAccounts(showToast) {
+  if (codexAccountsRefreshBusy) return codexAccountsRefreshBusy.catch(() => {});
+  codexAccountsRefreshBusy = loadCodexAccounts();
+  const btn = $('codexRefresh');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '刷新中…';
+  try {
+    await codexAccountsRefreshBusy;
+    $('codexAccountsUpdated').textContent =
+      '每 30 秒读取管理面快照（非主动查询上游额度）。快照读取时间：'
+      + new Date().toLocaleTimeString();
+    if (showToast) toast('账号/用量快照已刷新');
+  } catch (e) {
+    $('codexAccountsUpdated').textContent =
+      '快照刷新失败：' + e.message + '。页面可见时每 30 秒重试。';
+    if (showToast) toast('账号/用量快照刷新失败：' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+    codexAccountsRefreshBusy = false;
+  }
 }
 
 async function loadCodexAccounts() {
   try {
-    const result = await api('/api/cliproxy/accounts');
+    const result = await api('/api/cliproxy/accounts', { cache: 'no-store' });
     const files = result.files || [];
     if (!files.length) {
       setCodexStatus('未登录', 'd-none');
@@ -1453,7 +1585,9 @@ async function loadCodexAccounts() {
     setCodexStatus(worst.text, worst.cls);
     $('codexAccounts').textContent = files.map(codexDetail).join('；');
   } catch (e) {
+    setCodexStatus('账号状态读取失败', 'd-warn');
     $('codexAccounts').textContent = 'CLIProxyAPI 账号状态暂不可用：' + e.message;
+    throw e;
   }
 }
 
@@ -1472,7 +1606,7 @@ async function pollCodexLogin() {
       codexFlow = null;
       setCodexStatus('已登录', 'd-good');
       toast('Codex 登录成功');
-      await loadCodexAccounts();
+      await refreshCodexAccounts(false);
       return;
     }
     clearInterval(codexPollTimer);
@@ -1576,6 +1710,9 @@ async function runSelftest(probe) {
       }),
     });
     renderSelftest(result);
+    // 生成结束后重新读管理面，避免继续显示生成前的账号状态/用量。
+    if (codexAccountsRefreshBusy) await codexAccountsRefreshBusy.catch(() => {});
+    await refreshCodexAccounts(false);
   } catch (e) {
     $('selftestOut').innerHTML =
       '<div class="meta bad" style="margin-top:14px">自检失败：' + esc(e.message) + '</div>';
@@ -1693,8 +1830,13 @@ async function loadRules() {
 function reportApply(result) {
   if (!result) return;
   const errors = result.errors || [];
+  const notes = result.notes || [];
   if (errors.length) {
     toast('规则已保存，但让 mihomo 生效时报错：' + errors.join('；'), true);
+    return;
+  }
+  if (notes.length) {
+    toast('规则已生效（' + notes.join('；') + '）', true);
     return;
   }
   if (result.reloaded_config) {
@@ -1838,14 +1980,14 @@ $('speedtest').addEventListener('click', async () => {
 
 $('codexLogin').addEventListener('click', startCodexLogin);
 $('codexRefresh').addEventListener('click', () => {
-  loadCodexAccounts().then(() => toast('账号列表已刷新'));
+  refreshCodexAccounts(true);
 });
 $('codexCallbackSubmit').addEventListener('click', submitCodexCallback);
 $('selftest').addEventListener('click', () => runSelftest(false));
 $('selftestProbe').addEventListener('click', () => runSelftest(true));
 
 load().catch((e) => toast('加载失败：' + e.message, true));
-loadCodexAccounts();
+refreshCodexAccounts(false);
 loadRules().catch((e) => {
   $('rulesStatus').textContent = '不可用';
   $('rulesHint').className = 'meta warn';
@@ -1854,6 +1996,7 @@ loadRules().catch((e) => {
 setInterval(() => {
   if (!busy && state) load(state.group).catch(() => {});
   if (!busy) loadRules().catch(() => {});
+  if (!document.hidden && !codexFlow && !$('selftestProbe').disabled) refreshCodexAccounts(false);
 }, 30000);
 </script>
 </body>

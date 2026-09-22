@@ -11,14 +11,52 @@ python private_api.py --target both \
 配置文件的路径**不需要自己找**——脚本会自动扫描所有可能的位置（见下面的[自动检索](#自动检索哪些位置)），没有的会创建。
 不带 `--target` 在终端里跑，会进入交互式向导。
 
-需要 Python 3.11+（用到标准库 `tomllib`）。只用标准库，不需要 `pip install`。
+**web search 也在这条命令里配好了**，不用再跑第二条：两个插件各自注册一个指向网关的 MCP 端点，凭据复用你刚填的那把 LiteLLM key —— 全程只有**一把 key**，没有第二个 token 要申请。细节见[搜索（web search）](#搜索web-search)。
+
+只用标准库，不需要 `pip install`。
+
+> 这里此前写的是"需要 Python 3.11+（用到标准库 `tomllib`）"——**那是错的**：全仓库没有一处 `import tomllib`（它只在 `tomlpatch.py` 的一句注释里被提到，用来说明"标准库能读 TOML 但不能写，所以这个模块按行编辑")。已实测的是 Python 3.13；代码里没有 3.10+ 才有的语法（没有 `match`、没有运行期的 `X | Y` 联合类型，标注统一靠 `from __future__ import annotations` 延迟求值），所以 3.8+ 理论上都行，但没有在旧版本上验证过。
 
 入口脚本是 `vscode/private_api.py`，下面所有命令都假设你在 `vscode/` 目录里执行；在仓库根目录跑的话把 `private_api.py` 换成 `vscode/private_api.py` 即可。
+
+## 插件安装（.vsix 下载）
+
+这两个插件的 `.vsix` **不随仓库提交**——加起来 1.2 GB 以上，进 git 不划算。版本号记在这里，需要时按下面任意一种方式拿原版安装包。
+
+| 插件 | 版本 | 平台 | 大小 |
+|---|---|---|---:|
+| Claude Code（`anthropic.claude-code`） | 2.1.89 | 全平台共用一个包 | 18.45 MB |
+| Codex（`openai.chatgpt`） | 26.5908.31748 | `win32-x64` | 384.67 MB |
+| Codex（`openai.chatgpt`） | 26.5908.31748 | `win32-arm64` | 367.84 MB |
+| Codex（`openai.chatgpt`） | 26.5908.31748 | `linux-x64` | 238.39 MB |
+| Codex（`openai.chatgpt`） | 26.5908.31748 | `darwin-x64` | 232.85 MB |
+
+**方式一：让 VSCode 自己下（推荐）**——`code` 会按当前平台挑对的那个 Codex 包：
+
+```bash
+code --install-extension anthropic.claude-code@2.1.89
+code --install-extension openai.chatgpt@26.5908.31748
+```
+
+**方式二：直接下载 `.vsix`**——把版本号填进这个直链，`targetPlatform` 只有 Codex 这种按平台拆包的插件才需要（完整来源是 VS Code 官方 Marketplace，`publishers/<publisher>/vsextensions/<extension>/<version>/vspackage`）：
+
+```
+# Claude Code：全平台一个包，不带 targetPlatform
+https://marketplace.visualstudio.com/_apis/public/gallery/publishers/anthropic/vsextensions/claude-code/2.1.89/vspackage
+
+# Codex：按平台取，取值 win32-x64 / win32-arm64 / linux-x64 / linux-arm64 / darwin-x64 / darwin-arm64
+https://marketplace.visualstudio.com/_apis/public/gallery/publishers/openai/vsextensions/chatgpt/26.5908.31748/vspackage?targetPlatform=win32-x64
+```
+
+下完用 `code --install-extension <文件>.vsix` 装。不想拼 URL 就去插件页点右侧的 Download Extension：<https://marketplace.visualstudio.com/items?itemName=openai.chatgpt>、<https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code>。
+
+> 版本号要卡准：`--patch-only` 改的是 Claude Code 插件自带的 `claude.exe`，插件一升级就被换回原版，补丁会丢（见 [Claude Code 模型名过滤](#模型名过滤本工具存在的主要原因)）。Codex 那个插件不靠二进制补丁，但也建议先按这里的版本校验一遍，再决定要不要升级。
 
 ---
 
 ## 目录
 
+- [插件安装（.vsix 下载）](#插件安装vsix-下载)
 - [做了什么](#做了什么)
 - [自动检索哪些位置](#自动检索哪些位置)
 - [Claude Code](#claude-code)
@@ -30,8 +68,10 @@ python private_api.py --target both \
   - [修完 400 之后变成 500（client_metadata）](#-修完-400-之后变成-500client_metadata)
   - [qwen3-5-397b：上游只认"系统消息在最前"（已确认暂不修）](#️-qwen3-5-397b上游只认系统消息在最前已确认暂不修)
   - [Codex 打开就要求登录](#-codex-打开就要求登录)
+  - [模型能力配置：`model-config.jsonc`](#模型能力配置model-configjsonc)
   - [每个模型配思考档位](#-每个模型配思考档位)
   - [图片贴不进去：input_modalities](#️-图片贴不进去input_modalities)
+- [搜索（web search）](#搜索web-search)
 - [网关（LiteLLM）侧改动：脚本与用法](#网关litellm侧改动脚本与用法)
 - [命令速查](#命令速查)
 - [常见问题](#常见问题)
@@ -49,8 +89,11 @@ python private_api.py --target both \
 | Codex | `~/.codex/config.toml` | 写 `[model_providers.private]` + `model` + `model_catalog_json` |
 | Codex | `~/.codex/gateway-models.json` | **把模型下拉框换成网关模型**，不再显示 GPT-5.6 Sol/Terra/Luna 这些网关上没有的（见下） |
 | Codex | `~/.codex/auth.json` | 仅 `--fix-login`。**不写这个 Codex 永远弹登录**（见 [Codex 要求登录](#-codex-打开就要求登录)） |
-| Codex | `~/.codex/private-reasoning.json` | 仅 `--configure-reasoning`。每个私有模型暴露哪些思考档位（见 [思考模式](#-每个模型配思考档位)） |
-| Codex | `~/.codex/private-modalities.json` | 仅 `--configure-modalities`。**哪些模型能贴图**；默认取实测表，只在覆盖时才产生该文件（见 [图片贴不进去](#️-图片贴不进去input_modalities)） |
+| Codex | `vscode/model-config.jsonc` | **模型能力配置**（能不能贴图 / 几档思考 / 上下文多长），生成在**脚本旁边**、归你所有。改完用 `--apply-model-config` 同步进目录。**不在 `~/.codex` 里**，也**不随包发**（见 [模型能力配置](#模型能力配置model-configjsonc)） |
+| Codex | `~/.codex/private-reasoning.json` | 仅 `--configure-reasoning`。旧的按模型档位覆盖，**仍读取但优先级低于 `model-config.jsonc`**（见 [思考模式](#-每个模型配思考档位)） |
+| Codex | `~/.codex/private-modalities.json` | 仅 `--configure-modalities`。同上，**仍读取但优先级更低**（见 [图片贴不进去](#️-图片贴不进去input_modalities)） |
+| Claude Code | `~/.claude.json` 的 `mcpServers` | 主流程最后一步自动写，也可用 `--configure-search` 单独重配。**让模型能搜索**；注意**不是** `settings.json`（见下） |
+| Codex | `~/.codex/config.toml` 的 `[mcp_servers.searxng]` | 同上，也由主流程自动写。两个插件共用同一个 MCP 端点，用的是同一个 LiteLLM key |
 | Codex | `PRIVATE_API_KEY` 用户级环境变量 | 或改用 `--inline-key` 直接写进配置（见下） |
 | 网关 | 私有模型的 `litellm_params.allowed_openai_params` | 仅 `--apply-gateway-config`。**不改这个，Codex 每轮请求都 400**（见 [Codex 全 400](#-codex-请求私有模型全部-400)） |
 | 网关 | 私有模型的 `litellm_params.additional_drop_params` | 仅 `--apply-gateway-config`。**不改这个，Codex 每轮请求都 500**（见 [Codex 变 500](#-修完-400-之后变成-500client_metadata)） |
@@ -513,6 +556,89 @@ python private_api.py --fix-login     # 撤销：--fix-login --restore
 > 代价：`auth.json` 是磁盘上的明文，和它重复的 `env_key` 配置一样。这是换取"不需要 ChatGPT
 > 账号"的代价。原本的 `auth.json` 会备份成 `auth.json.bak`。
 
+### 模型能力配置：`model-config.jsonc`
+
+下面两节（思考档位、图片贴不进去）说的是**同样三件事**——每个模型能不能贴图、有几档思考、上下文多长。这三项**不再是 Python 常量**，而是一份归你所有的数据文件：
+
+```
+vscode/                            ← 打完 patch 后就是这里
+├── private_api.py
+├── model-config.jsonc             ← 首次跑 --refresh-models 生成，之后归你改
+└── private-api/
+    └── model-config.seed.jsonc    ← 随包发的实测知识库（别改）
+```
+
+**为什么放在脚本旁边而不是 `~/.codex` 里。** 放 `~/.codex/` 更"规范"，但用户找不到的配置文件等于没人改的配置文件。`--status` 会把它全路径打出来。
+
+#### 一次配置，两步走
+
+```bash
+python private_api.py --target codex --refresh-models    # 第 1 步：生成/追加，并【立即应用】
+python private_api.py --apply-model-config               # 第 2 步：你改完之后，同步进真实环境
+```
+
+1. **首次运行（patch 流程 / `--refresh-models`）**生成 `model-config.jsonc`（= seed 的实测结论 ⊕ 网关当前模型列表），然后**立刻**写进 `model_catalog_json` 指向的那份目录。**打完 patch 就能用**，第 2 步不是前置条件。
+2. 之后每次运行只把网关**新出现**的 slug 追加进去；**绝不重写你写下的条目，注释也不动**。
+3. 你改完 → `--apply-model-config` 校验、重新解析、重写目录。
+
+字段就这四项：
+
+```jsonc
+"glm-5.3-flash": {
+  "input_modalities": ["text", "image"],   // 实测：能分辨红/蓝
+  "reasoning_levels": ["low", "high", "xhigh"],
+  "default_reasoning_level": "high",
+  "context_window": 128000
+}
+```
+
+**建议值**：`input_modalities` 默认只有 `text`；`context_window` 网关报了 `max_input_tokens` 就用网关的、没报就 **128K**；思考档位非 OpenAI 模型默认 **vscode 这一个工具包的三档** `low/high/xhigh`（见下）。实测能看图的模型已经预填成 `["text","image"]`。
+
+#### 解析优先级（逐字段独立，高 → 低）
+
+1. `model-config.jsonc` 里该模型的这个字段 ← **你写的**
+2. 旧的 `private-modalities.json` / `private-reasoning.json`（**只读**，老装机沿用旧选择）
+3. OpenAI 官方模型（`gpt-*`/`o*`）→ `models_cache.json`，**不覆盖官方声明**
+4. 网关 `GET /v1/models` 主动广告的字段
+5. `model-config.seed.jsonc` 里该模型的实测值
+6. `_defaults` ⊕ `_toolkits.vscode`
+
+**删一个字段就回落一个字段。**
+
+#### 为什么 vscode 这一份停在 `xhigh`
+
+同一个 `_defaults` 发给两个工具包会把已修好的 bug 带回来，所以按工具包覆盖：
+
+```jsonc
+"_toolkits": { "vscode": { "reasoning_levels": ["low", "high", "xhigh"] } }
+```
+
+理由就是下一节实测出来的那条：**这个插件的 webview 画不出 `max` 那一行**（画不出就整行不显示，看着像功能丢了）。CLI 那边没有这个限制，所以它默认到真正的天花板 `max`——两份默认值**故意不同**，不是漂移。
+
+#### 为什么是平铺，不是嵌套在 `"models"` 下
+
+因为 `private-api/jsonc.py` 的 `set()` **只支持顶层键**，且会重编码整个被替换的值。一旦嵌套，任何一次写入都会**抹掉 `models` 里所有注释**——而"追加新模型"恰恰是最常发生的写入。
+
+#### 写坏了会怎样（fail-open）
+
+文件语法错、值非法 → **目录照样生成，Codex 照样启动**，坏值被丢掉、回落到 seed 与 `_defaults`。但**不会静默**：`--status` 和 `--apply-model-config` 会把问题打出来，语法错还给出精确行列号。
+
+```console
+! 3 problem(s) -- the bad values are ignored, the rest still applies
+    glm-5.3-flash.input_modalities: 'hologram' 不是 Codex 认的值（只有 text/image/audio）
+    glm-5.3-flash.context_window: 应该是整数
+```
+
+值非法会让整个目录解析失败 → **Codex 直接起不来**（不是降级），所以枚举校验留在代码里（`KNOWN_MODALITIES` / `KNOWN_EFFORTS`），配置只提供值。
+
+> **网关改了模型 id 就是一次重测，不是 find-and-replace。** 踩过：严格那个后端最早以
+> `deepseek-v4.1-flash-test` 测出能看图，网关改成 serve `deepseek-v4.1-flash` 后，表里还是旧
+> id → 新 id 落进默认的 `("text",)` → **插件在客户端就拒掉贴图**，提示 "This model does not
+> support image inputs."。生效的是**代码**，本地文件里没有可改的东西，修复只能等新版本。
+> 这件事就是这次改动的起因。现在改数据文件即可，`--probe-modalities` 给结论。
+
+---
+
 ### ⚠️ 每个模型配思考档位
 
 Codex 的 Reasoning 子菜单**完全由我们生成的模型目录决定**，靠两个字段：
@@ -529,7 +655,19 @@ Codex 的 Reasoning 子菜单**完全由我们生成的模型目录决定**，�
 **OpenAI 官方模型保持原样**：它们的档位直接从 `models_cache.json` 原样抄，
 不受本工具配置影响（`gpt-5.6-sol` 依旧是 low/medium/high/xhigh/max/ultra）。
 
-**私有化模型可配**，默认 `low/high/xhigh`：
+**私有化模型可配**，默认 `low/high/xhigh`。**档位现在写在 `model-config.jsonc` 里**（见上一节）：
+
+```jsonc
+"deepseek-v4-flash": {
+  "reasoning_levels": ["low", "medium", "high", "max"], "default_reasoning_level": "high"
+}
+```
+
+```bash
+python private_api.py --apply-model-config     # 改完同步进真实环境，重载 VSCode 窗口
+```
+
+旧的按模型覆盖仍然可用（写 `$CODEX_HOME/private-reasoning.json`，**只读兼容、优先级低于配置文件**）：
 
 ```bash
 # 交互式挑模型、填档位
@@ -548,7 +686,8 @@ python private_api.py --configure-reasoning --reasoning-model glm-5.3-flash --re
 python private_api.py --configure-reasoning --reasoning-clear deepseek-v4-flash
 ```
 
-改完执行 `--target codex --refresh-models` 重生成目录，重载 VSCode 窗口即可看到。
+> 要**不给**某个模型 Reasoning 子菜单，在配置文件里写 `"reasoning_levels": []` —— 空数组是有效值，
+> 表示"这个模型没有思考菜单"，对纯聊天模型正合适。
 
 > 档位名必须在 Codex 认识的集合内（`none/minimal/low/medium/high/xhigh/max/ultra/persistent`），
 > 否则整个目录会让 Codex **启动即失败**。工具会校验并拒绝非法值。
@@ -629,18 +768,42 @@ python private_api.py --probe-modalities --probe-models glm-5.3-flash   # 只测
 
 2026-09-16 实测结果（64×64 纯色图，问主色）：
 
+> 表按网关**实际 serve** 的 slug 记。严格那个后端最早以 `deepseek-v4.1-flash-test` 测得能看图，
+> 网关后来改 serve `deepseek-v4.1-flash`，旧 id 留在表里 → 新 id 落进默认值 `("text",)` → 贴图被拒。
+> 2026-09-17 用新 slug 重测，仍是 Red / Blue。
+
 | 模型 | 结果 | 结论 |
 |---|---|---|
-| `deepseek-v4.1-flash-test` | Red / Blue ✓ | 能看图 |
+| `deepseek-v4.1-flash` | Red / Blue ✓ | 能看图 |
 | `glm-5.3-flash` | Red / Blue ✓ | 能看图 |
 | `qwen3-5-397b` | Red / Blue ✓ | 能看图 |
 | `xinghai-ultra` | 拒答，或答 Black/Orange | ❌ **收得下但看不见**，两次行为还不一致 |
 | `deepseek-v4-flash` | HTTP 400 | ❌ 上游直接拒：`Model only supports text input` |
 
-这个结果**已经写进 `modalities.py` 的实测表**，所以按默认值重生成目录就直接对了——
-不用手工配。
+这个结果**已经写进随包发的 `private-api/model-config.seed.jsonc`**，并预填进了
+`model-config.jsonc`，所以按默认值重生成目录就直接对了——不用手工配。
 
-**手工改**（换个模型、或后端升级后）：
+**手工改**（换个模型、或后端升级后）——直接改 `model-config.jsonc`：
+
+```jsonc
+"glm-5.3-flash": { "input_modalities": ["text", "image"] }
+```
+
+```bash
+python private_api.py --apply-model-config     # 或 --target codex --refresh-models
+```
+
+`--probe-modalities` **不改文件**，它把**可以直接粘贴的片段**打出来给你抄（写回要重编码嵌套
+条目、会抹注释，收益不抵风险）：
+
+```console
+To enable, paste these entries into ...\vscode\model-config.jsonc
+(or edit the ones already there) and run: python private_api.py --apply-model-config
+
+    "glm-5.3-flash": { "input_modalities": ["text", "image"] },
+```
+
+旧的按模型覆盖仍可用（写 `~/.codex/private-modalities.json`，**只读兼容、优先级低于配置文件**）：
 
 ```bash
 python private_api.py --configure-modalities \
@@ -649,13 +812,125 @@ python private_api.py --configure-modalities --modalities-model <模型id> --mod
 python private_api.py --configure-modalities --modalities-clear <模型id|all>
 ```
 
-改完 `--target codex --refresh-models`，重载 VSCode 窗口。
-
 > **别"全开"**。把 `deepseek-v4-flash` 打开 → 每轮 400；把 `xinghai-ultra` 打开 →
 > 每轮拿到编造的答案且**没有任何报错**。后一种比现在贴不了图更糟。
 >
-> 用户覆盖存在 `~/.codex/private-modalities.json`（只在改过之后才产生）。
-> 覆盖只对私有模型有效；OpenAI 官方模型的 `input_modalities` 同样**不可配**。
+> **OpenAI 官方模型不可配**：它们的 `input_modalities` 和思考档位一样从 `models_cache.json`
+> 原样抄，`model-config.jsonc` 里**刻意不放** `gpt-*`/`o*` 条目——目录是整体替换的，我们写什么
+> 就盖掉 OpenAI 自己的定义。旧的 `~/.codex/private-modalities.json` 只对私有模型有效。
+
+## 搜索（web search）
+
+### 两个插件的自带搜索都用不了，原因相同
+
+Claude Code 的 `WebSearch` 和 Codex 插件的 web_search **都是服务端（托管）工具**——它们请求的是
+厂商的服务器，不是这个网关。网关又只代理 `/v1/*`，所以两个都没法工作。**服务端没有开关可配。**
+
+出路是把搜索放到**客户端侧**做成一个模型能主动调用的工具，也就是 MCP。两个插件都是 MCP 客户端，
+连同一个地址即可，与它们背后是什么模型无关。
+
+### ★ 你不用为搜索做任何额外的事
+
+搜索配置是主流程的**最后一步**，自动完成，而且**复用的就是刚写进去的那个 LiteLLM key**。
+所以整件事仍然只有一条命令：
+
+```bash
+python private_api.py --target both --api-base http://<网关>:4000 --api-key sk-你自己的
+```
+
+**没有第二个 key。** 搜索端点挂在网关后面（`<网关>:4000/searxng/mcp`），用的就是你自己的
+LiteLLM virtual key——和模型调用是同一把。服务端有一个 `MCP_SEARXNG_TOKEN`，但那是
+**服务端内部凭据**，只用于「网关 → searxng-mcp」那一跳，用户永远看不到、也不需要知道。
+
+搜索放在最后一步是因为它要复用前面刚写的 key；拿不到 key 时它只打印一行提示、
+**不影响退出码**（配模型才是主任务，不该被附加项拖失败）。`--no-search` 可以跳过。
+
+### 两个插件写的是**两个不同**的文件，格式还**不能互换**
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.searxng]
+url = "http://<网关>:4000/searxng/mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.searxng.http_headers]
+Authorization = "Bearer sk-<你自己的 LiteLLM key>"
+```
+
+```jsonc
+// ~/.claude.json
+{
+  "mcpServers": {
+    "searxng": {
+      "type": "http",
+      "url": "http://<网关>:4000/searxng/mcp",
+      "headers": { "Authorization": "Bearer sk-<你自己的 LiteLLM key>" }
+    }
+  }
+}
+```
+
+| | Codex | Claude Code |
+|---|---|---|
+| 文件 | `~/.codex/config.toml` | **`~/.claude.json`** |
+| `type` 字段 | **不能有**（从 `url` 推断传输） | **必需**，缺了会被当成 stdio 跳过 |
+| 认证 | `http_headers` | `headers` |
+| 写错的表现 | 报 `is not supported for streamable_http` | **静默跳过**，`/mcp` 里什么都没有 |
+
+**Claude Code 的文件是 `~/.claude.json`，不是 `~/.claude/settings.json`。** 这一点是照着
+装机版扩展逐一核对出来的，不是猜的：扩展用一个 helper 同时构造
+`globalConfig = <home>/.claude.json` 和 `userSettings = <home>/.claude/settings.json`，而
+`mcpServers` **不在** `claude-code-settings.schema.json` 里——写进 settings.json 会被**静默忽略**。
+
+Codex 侧的 token 为什么走 `http_headers` 而不是 `bearer_token_env_var`：后者只在那个变量存在于
+**Codex 继承到的环境**里才有效，而 VSCode 插件由编辑器启动，环境我们控制不了。变量缺失不会有任何
+提示，请求直接裸奔成 401。字面 header 在所有启动方式下行为一致。
+
+**这一点现在几乎没有代价了**：写进去的值就是你自己的 LiteLLM key，而它本来就在同一个文件里
+（模型配置用的就是它）。没有引入新秘密，也没有第二个文件要同步。
+
+### 工具名会带 `searxng-` 前缀，这是正常的
+
+网关暴露的是 `<服务名>-<工具名>`，所以模型看到的是 `searxng-web_url_read`、
+`searxng-searxng_web_search`（后者双重，因为服务名和工具名本身都叫 searxng）。
+
+**这个前缀改不掉。** 实测把 `tool_name_to_display_name` 设成完整的反向映射后，`tools/list`
+返回的**仍然是**前缀名——那个字段只影响显示层。所以别去调它，看到前缀就当没看见。
+
+### 命令
+
+```bash
+# 平时不需要单独跑：主流程的 --target both 已经包含搜索
+python private_api.py --target both --api-base http://<网关>:4000 --api-key sk-xxx
+
+# 以下是单独重配 / 排查用的
+python private_api.py --configure-search --target both   # 只重配搜索
+python private_api.py --check-search                     # 握手 + 列工具
+python private_api.py --search-clear                     # 撤销
+python private_api.py --target both --no-search           # 配模型但跳过搜索
+```
+
+不带 `--target` 时搜索默认写**两个**——一个 MCP 端点服务两个插件，没有理由只配一半。
+
+token 的取值顺序是 `--search-token` → **当前配置里的 LiteLLM key** → `$MCP_SEARXNG_TOKEN`。
+环境变量**故意排在最后**：一个残留在 shell 里的旧 `MCP_SEARXNG_TOKEN` 不应该悄悄遮蔽掉正常路径。
+`--search-token` 保留是为了「后端直连、不走网关」这种排错场景。
+
+`--check-search` 除了握手，还会报两种**静默漂移**：
+
+- 两个插件的配置指向了不同的服务器——症状是「一个编辑器能用，另一个 401」，而两边配置看起来一样；
+- 配置里的 URL 和「当前网关推导出的端点」已经不一致——旧配置在网关换地址后不会自己更新，
+  症状是连接错误而不是配置错误。
+
+配完**重启 VSCode**（插件在启动时读配置）。Claude Code 里 `/mcp` 应该能看到 `searxng`。
+
+> **搜索服务端本身的部署与分层验证见 [`../searxng/README.md`](../searxng/README.md)。**
+> 客户端配好了不代表服务端是好的——那边第 4 层（用**普通用户 key**走网关真握手）跑通之前，
+> 不要认为这套东西是好的。另外：**VSCode 里 Claude Code 的 MCP 客户端尚未被实测过**
+> （这台机器上没有 `claude` CLI），请自己点一次搜索确认；Codex 那半边是真跑过的。
+
+---
 
 ## 网关（LiteLLM）侧改动：脚本与用法
 
@@ -785,18 +1060,30 @@ python private_api.py --target codex --profile work        # 写 [profiles.work]
 python private_api.py --target codex --skip-probe          # 跳过 /v1/responses 探针
 python private_api.py --target codex --strip-openai-keys   # 删掉 service_tier 这类 OpenAI 专属键
 
+# 搜索（让模型能搜网页）。平时不用单独跑：--target both 已包含，用的是同一个 LiteLLM key
+python private_api.py --configure-search                 # 只重配搜索，两个插件都写
+python private_api.py --configure-search --target claude # 只写 Claude Code
+python private_api.py --check-search                     # 握手 + 列工具 + 检查两种漂移
+python private_api.py --search-clear
+python private_api.py --target both --no-search          # 配模型但跳过搜索
+
 # Codex 登录（不写 auth.json 就会一直弹登录）
 python private_api.py --fix-login                          # 写入网关 key 作为 API key 登录
 python private_api.py --fix-login --force                  # 已登录也覆盖（轮换 key 后用）
 python private_api.py --fix-login --restore                # 还原 auth.json
 
-# 每个模型的思考档位
+# 模型能力（能不能贴图 / 几档思考 / 上下文多长）—— 直接改 vscode/model-config.jsonc
+# 大部分情况不用动：实测结论已预填，网关新模型会自动追加进来
+$EDITOR model-config.jsonc
+python private_api.py --apply-model-config                  # 改完同步进真实环境
+
+# 旧的按模型覆盖（仍读取，但 model-config.jsonc 优先级更高）
 python private_api.py --configure-reasoning                # 交互式
 python private_api.py --configure-reasoning --reasoning-model <id> \
     --reasoning-levels low,high,xhigh --reasoning-default high
 python private_api.py --configure-reasoning --reasoning-clear <id|all>
 
-# 能否贴图（默认已按实测结果配好，一般不用动）
+# 能否贴图：测量不改文件，给结论 + 可粘贴片段
 python private_api.py --probe-modalities                    # 实测哪些模型真能看图
 python private_api.py --configure-modalities --modalities-model <id> \
     --modalities text,image
@@ -837,6 +1124,27 @@ python private_api.py --restore --target both
 **替换 `claudeCode.environmentVariables` 时注释丢了吗？**
 那个数组**内部**的注释会随旧值一起被替换掉（文本手术只能保住数组外的内容）。改动前的完整内容在 `settings.json.bak` 里。
 
+**模型不会搜索 / 说它不能联网？**
+两个插件自带的搜索**都是服务端工具**，网关又只代理 `/v1/*`，所以在这个部署里**不可能**工作（见[搜索](#搜索web-search)）。正常跑一次主流程命令就会接上 MCP。已经配过还是不行就用 `--check-search` 定位。
+
+**配了搜索，Claude Code 的 `/mcp` 里什么都没有？**
+多半写错文件了。Claude Code 的 MCP 配置在 **`~/.claude.json`**（user scope），**不是** `~/.claude/settings.json`——后者的 schema 里根本没有 `mcpServers`，写进去会被静默忽略。另一个常见原因是漏了 `type: "http"`：只有 `url` 没有 `type` 会被当成 stdio 跳过。
+
+**`--check-search` 报 404 `MCP server ... not found`？**
+网关起来了但不知道这个 MCP server。在**网关那台机器**上跑 `python ../searxng/register_mcp.py`。这是服务器一次性动作，客户端无能为力。
+
+**`--check-search` 报 401？**
+客户端用的是**你自己的 LiteLLM key**，所以基本只有一个原因：搜索那步跑在模型配置之前，或者用了和模型配置不同的 `--api-key`。重跑主流程命令即可。**不存在第二个搜索 key**——服务端的 `MCP_SEARXNG_TOKEN` 客户端根本不碰。
+
+**服务器上 `register_mcp.py --check` 报 `unhealthy`，但 searxng-mcp 的 `/health` 是绿的？**
+`MCP_HTTP_ALLOWED_HOSTS` 里没有 `searxng-mcp:8090`。它默认只允许回环地址，且拿它跟请求的 `Host` 头**连端口精确比对**——网关以容器身份来连，`Host` 就是服务名那个值。用**服务名**而不是 IP，换机器就不用改。详见 [`../searxng/README.md`](../searxng/README.md)。
+
+**`--check-search` 提示「配置的 URL 与网关端点不一致」？**
+配置是旧地址（网关换过地址或端口）。旧配置不会自己更新，症状是连接错误而不是配置错误。重跑主流程命令重写即可。
+
+**一个编辑器能搜索，另一个不行？**
+两边的配置文件看起来一样但 `url` 不同（典型是一条被单独重配过）。`--check-search` 会直接报出来，重跑主流程命令或 `--configure-search` 对齐即可。
+
 **key 泄露风险？**
 `--status` 输出里的 key 是打码的（`sk-d4s...5LJQ`）。但 `settings.json`、`~/.claude/settings.json`、`config.toml` 本身都是明文存 key 的——和官方客户端的做法一致，注意别把这些文件连同 `.bak` 一起提交到仓库。
 
@@ -847,18 +1155,24 @@ python private_api.py --restore --target both
 ```
 vscode/
 ├── private_api.py           # 入口脚本，唯一需要直接执行的文件
+├── model-config.jsonc       # 模型能力配置（跑过一次 --refresh-models 后生成，之后归你改）
 ├── README.md                # 本文档
 ├── codex-model.sh/.bat      # 跑过一次 --target codex 后自动生成
 └── private-api/             # 支持模块，无需直接调用
     ├── detect.py            # 自动检索各类配置/二进制位置
     ├── jsonc.py             # 保留注释与缩进的 JSONC 读写
+    ├── modelconfig.py       # model-config.jsonc 的 schema / 读写 / seed 合并 / 校验
+    ├── model-config.seed.jsonc  # 随包发的实测知识库（数据，不是模块）
     ├── tomlpatch.py         # 只改目标行的 TOML 读写
     ├── gateway.py           # /v1/models 拉取、base URL 归一化、端点探针
     ├── claude.py            # Claude Code 环境变量写入与合并
     ├── claude_patch.py      # claude.exe 模型名过滤补丁
     ├── codex.py             # Codex config.toml 写入、模型切换、模型目录生成
     ├── codex_auth.py        # auth.json 写入，解决 Codex 登录门
-    ├── reasoning.py         # 每个模型的思考档位（私有可配 / OpenAI 原样）
-    ├── modalities.py        # 每个模型能不能贴图：实测表 + 覆盖 + 红蓝判别探针
+    ├── reasoning.py         # 每个模型的思考档位（值在 model-config.jsonc；这里只留枚举与解析）
+    ├── modalities.py        # 每个模型能不能贴图：红蓝判别探针 + 解析（值同上）
     └── litellm_admin.py     # 网关模型参数：生成 /model/update 命令或直接应用
 ```
+
+`jsonc.py` / `modelconfig.py` / `model-config.seed.jsonc` / `search.py` 与 `codexcli/` 里对应文件是**逐字节相同**的拷贝，改一份就要同步另一份。
+`modalities.py` 和 `reasoning.py` 只差**开头几行**（声明 `TOOLKIT = modelconfig.TOOLKIT_VSCODE`，以及 `reasoning.py` 里那个 vscode 专用的 `DEFAULT_EFFORTS`），其余必须保持一致 —— 用 `diff` 应该只看到那几行。

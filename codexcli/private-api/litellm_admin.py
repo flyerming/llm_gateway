@@ -124,13 +124,13 @@ def fetch_model_info(base: str, api_key: str, *, timeout: float = 30.0) -> list[
     if status != 200:
         snippet = body[:400].decode(errors="replace")
         raise gateway.GatewayError(
-            f"gateway returned HTTP {status} for {url}\n  {snippet}\n"
-            "  -> /model/info needs the LiteLLM MASTER key, not a virtual key"
+            f"网关访问 {url} 返回 HTTP {status}\n  {snippet}\n"
+            "  -> /model/info 需要使用 LiteLLM 主密钥（MASTER key），不能用虚拟密钥"
         )
     try:
         payload = json.loads(body.decode("utf-8"))
     except ValueError as e:
-        raise gateway.GatewayError(f"{url} did not return JSON: {e}") from e
+        raise gateway.GatewayError(f"{url} 没有返回 JSON：{e}") from e
 
     entries = payload.get("data") if isinstance(payload, dict) else payload
     return [e for e in (entries or []) if isinstance(e, dict)]
@@ -153,7 +153,7 @@ def _drops_client_metadata(params: dict) -> bool:
 def describe(plan: Plan) -> str:
     """One line naming what this plan adds, for reports and command comments."""
     if plan.already_ok:
-        return "already accepts Codex's Responses fields"
+        return "已可直接接收 Codex 的 Responses 字段"
     if plan.reason:
         return plan.reason
     parts = []
@@ -187,12 +187,12 @@ def build_report(entries: list[dict]) -> Report:
             # A native provider already accepts the parameter, or is not a chat
             # model at all. Saying so beats leaving the user wondering why a
             # model is missing from the list.
-            plan.reason = f"provider {provider or '(unset)'} is out of scope"
+            plan.reason = f"provider 为 {provider or '(未设置)'}，不在处理范围内"
         elif not plan.model_id:
-            plan.reason = "no model_info.id; cannot target it with /model/update"
+            plan.reason = "缺少 model_info.id，无法通过 /model/update 定位该模型"
         elif not params.get("api_base"):
             # Refuse loudly rather than emit a body that would wipe api_base.
-            plan.reason = "no api_base in litellm_params; refusing to resend a partial body"
+            plan.reason = "litellm_params 中缺少 api_base，拒绝发送不完整的请求体"
         else:
             if needs_reasoning:
                 allowed = params.get("allowed_openai_params")
@@ -248,8 +248,8 @@ def apply_plan(base: str, api_key: str, plan: Plan, *, timeout: float = 60.0) ->
     """
     if not plan.params.get("api_base"):
         raise gateway.GatewayError(
-            f"refusing to update {plan.model_name}: the new litellm_params has no "
-            "api_base, which would break the model for every client"
+            f"拒绝更新 {plan.model_name}：新的 litellm_params 中缺少 "
+            "api_base，会导致所有客户端都无法使用该模型"
         )
 
     url = gateway.normalize_base(base, keep_v1=False) + UPDATE_PATH
@@ -259,5 +259,5 @@ def apply_plan(base: str, api_key: str, plan: Plan, *, timeout: float = 60.0) ->
     if status != 200:
         snippet = body[:500].decode(errors="replace")
         raise gateway.GatewayError(
-            f"gateway refused the update for {plan.model_name} (HTTP {status})\n  {snippet}"
+            f"网关拒绝更新 {plan.model_name}（HTTP {status}）\n  {snippet}"
         )

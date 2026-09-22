@@ -8,7 +8,9 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 if ([string]::IsNullOrWhiteSpace($Release)) {
-    $Release = "latest"
+    # Pinned on purpose: this script ships as codex-cli-install-0.154.0.ps1, so
+    # a bare run must install 0.154.0. Override with -Release or $env:CODEX_RELEASE.
+    $Release = "0.154.0"
 }
 
 $NonInteractive = $env:CODEX_NON_INTERACTIVE -match "^(?i:1|true|yes)$"

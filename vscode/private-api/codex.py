@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 import modalities
+import modelconfig
 import reasoning
 from tomlpatch import TomlFile
 
@@ -213,19 +214,19 @@ def set_env_var(name: str, value: str) -> str:
     if os.name == "nt":
         try:
             subprocess.run(["setx", name, value], check=True, capture_output=True, timeout=30)
-            return f"setx {name} (restart VSCode for it to take effect)"
+            return f"已设置 {name}（重启 VSCode 后生效）"
         except Exception as e:  # noqa: BLE001
-            return f"FAILED to setx {name}: {e}"
+            return f"设置 {name} 失败：{e}"
 
     shell = os.environ.get("SHELL", "")
     rc = Path.home() / (".zshrc" if "zsh" in shell else ".bashrc")
     marker = f"export {name}="
     existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
     if marker in existing:
-        return f"{name} already exported in {rc} (edit it there to rotate)"
+        return f"{name} 已在 {rc} 中导出（可在该文件里修改以轮换密钥）"
     with rc.open("a", encoding="utf-8") as fh:
         fh.write(f'\n# added by private-api: Codex gateway key\nexport {name}="{value}"\n')
-    return f'appended export {name}=... to {rc} (open a new shell)'
+    return f"已把 export {name}=... 追加到 {rc}（请打开新终端）"
 
 
 def find_codex_binary() -> Path | None:
@@ -237,7 +238,7 @@ def run_codex_doctor() -> str:
     """`codex doctor` gives a second opinion on the finished config."""
     exe = find_codex_binary()
     if not exe:
-        return "codex binary not found; skipping"
+        return "未找到 codex 可执行文件，跳过"
     try:
         out = subprocess.run([str(exe), "doctor"], capture_output=True, text=True, timeout=120)
         return (out.stdout or out.stderr).strip()
@@ -273,12 +274,50 @@ TRUNCATION_POLICY = {"mode": "tokens", "limit": 10000}
 # Gateways rarely report a context length (LiteLLM only fills `max_input_tokens`
 # for models it has metadata for), and an entry without one makes Codex fall back
 # to something tiny. 128K is a safe floor for a modern coding model.
+#
+# NO LONGER THE PRIMARY SOURCE: `context_window_for` reads the user's
+# `model-config.jsonc`, then the gateway, then `model-config.seed.jsonc`, and only
+# falls back here. Kept as the last resort for an unreadable config file -- the
+# per-model resolution order is in that function's docstring.
 DEFAULT_CONTEXT_WINDOW = 128_000
 
 
 def catalog_path() -> Path:
     from detect import codex_home
     return codex_home() / CATALOG_FILENAME
+
+
+def context_window_for(model_id: str, raw: dict | None = None,
+                       toolkit: str = modelconfig.TOOLKIT_VSCODE) -> int:
+    """How much context Codex should assume for one model.
+
+    Order, most specific first:
+
+      1. `model-config.jsonc` (beside `private_api.py`) -- the user's file. This
+         is the only way to PIN a number, and the generated file writes one out
+         for every model so the value is visible and editable rather than implied.
+      2. The gateway's `max_input_tokens`. LiteLLM only fills it for models it
+         has metadata for, so it is frequently absent.
+      3. `model-config.seed.jsonc` / `_defaults` from the config file.
+      4. DEFAULT_CONTEXT_WINDOW -- last resort for an unreadable config file.
+
+    This is a **compaction trigger, not a client-side cap**: Codex auto-compacts
+    at 90% and hard-stops at 95% of it rather than raising. So over-filling it is
+    the dangerous direction -- Codex then sends oversized requests the gateway
+    400s -- which is why every fallback here is the conservative one.
+    """
+    meta = raw or {}
+    candidates = (
+        modelconfig.configured(model_id, modelconfig.FIELD_CONTEXT),
+        meta.get("max_input_tokens"),
+        modelconfig.suggested_value(model_id, modelconfig.FIELD_CONTEXT, toolkit),
+    )
+    for candidate in candidates:
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_CONTEXT_WINDOW
 
 
 def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
@@ -288,11 +327,7 @@ def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
     Codex sends it as `model` and LiteLLM routes on exactly that string.
     """
     raw = model.raw or {}
-    ctx = raw.get("max_input_tokens") or DEFAULT_CONTEXT_WINDOW
-    try:
-        ctx = int(ctx)
-    except (TypeError, ValueError):
-        ctx = DEFAULT_CONTEXT_WINDOW
+    ctx = context_window_for(model.id, raw)
 
     levels, default_level = reasoning.levels_for(model.id, raw)
     if not levels:
@@ -301,7 +336,7 @@ def catalog_entry(model: "Model", priority: int) -> dict[str, object]:
     return {
         "slug": model.id,
         "display_name": model.id,
-        "description": f"Private gateway model · {ctx // 1000}K context",
+        "description": f"私有网关模型 · {ctx // 1000}K 上下文",
         "priority": priority,
         # "list" is what puts an entry in the dropdown; Codex's own hidden
         # entries (gpt-reserve) use "hide".
@@ -347,7 +382,7 @@ def write_catalog(path: Path, models: Iterable["Model"]) -> list[str]:
     catalog = build_catalog(models)
     entries = catalog["models"]
     if not entries:
-        raise ValueError("no chat-capable gateway models to put in the catalog")
+        raise ValueError("网关没有可用于目录的对话模型")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n",
                     encoding="utf-8")
