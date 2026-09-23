@@ -1,6 +1,14 @@
+# 说明：上游源码目录 deepseek-harness-dsh-*/ 现在**必须**进入构建上下文——
+# Dockerfile 用 COPY 把本地上游 checkout 复制进镜像，不再在构建阶段 git clone。
+# 因此这里不再排除它，只排除它内部不需要进镜像的内容。
+
+# 上游 checkout 自带的 .git（约 23MB）。镜像构建不依赖它：版本/commit 信息由
+# Dockerfile 的 DSH_COMMIT_HASH 参数补齐，lefthook 在没有 .git 时会自动跳过。
 .git
-deepseek-harness-dsh-*/
+**/.git
+
 .dsh-build
+**/.dsh-build
 node_modules
 **/node_modules
 **/.vite

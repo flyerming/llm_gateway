@@ -1,0 +1,15 @@
+# 保证这些「进容器/进 shell」的文件在任何平台上都以 LF 落地。
+# 本机在 Windows（core.autocrlf=true）下检出会写成 CRLF，而 CRLF 的
+# start.sh 在 Linux 容器里会直接 `bad interpreter`，CRLF 的 Dockerfile /
+# nginx.conf 也可能出问题，所以这里强制文本为 LF。
+* text=auto eol=lf
+
+# 二进制类型不要被当成文本改写。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.vsix binary
+*.pdf binary

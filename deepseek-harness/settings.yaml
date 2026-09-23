@@ -1,16 +1,17 @@
-# Copied into each user's DSH_HOME on first access.
-# provision.py replaces __DSH_MODELS__ with DSH_DEFAULT_MODEL_IDS.
+# DSH_DEPLOY_SETTINGS_V3
+agent-default-model:
+  provider: "private-gateway"
+  model: "__DSH_DEFAULT_MODEL__"
 llm-pi-ai:
   providers:
     private-gateway:
-      displayName: Private LiteLLM Gateway
-      # Credential reference name only. The actual value is saved per user in
-      # $DSH_HOME/.credentials.yaml through the Web UI.
-      apiKeyEnv: DSH_LITELLM_API_KEY
-      api: openai-completions
-      baseURL: http://litellm:4000/v1
+      displayName: "Private LiteLLM Gateway"
+      apiKeyEnv: "DSH_LITELLM_API_KEY"
+      api: "openai-completions"
+      baseURL: "http://litellm:4000/v1"
       defaultContextWindow: 128000
       defaultMaxTokens: 32768
-      defaultInput: [text]
+      defaultInput:
+        - "text"
       models:
 __DSH_MODELS__

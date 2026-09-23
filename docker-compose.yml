@@ -47,7 +47,11 @@ services:
         # 列出的是配置里声明的两个本地例外清单；已存在就保留内容，绝不覆盖。
         mkdir -p /app/mihomo/ruleset
         for f in CustomDirect.list CustomProxy.list; do
-          [ -e "/app/mihomo/ruleset/$f" ] || : > "/app/mihomo/ruleset/$f"
+          # 注意：这里必须写 $$f 而不是 $f。compose 会把单个 $ 当成自己的变量
+          # 插值（docker compose 每条命令都会打
+          # `WARN The "f" variable is not set. Defaulting to a blank string.`），
+          # $$ 转义成字面 $ 交给容器里的 shell，循环变量才真正生效。
+          [ -e "/app/mihomo/ruleset/$$f" ] || : > "/app/mihomo/ruleset/$$f"
         done
         exec /app/mihomo-linux-amd64 -d /app/mihomo
     healthcheck:
@@ -271,20 +275,50 @@ services:
 
   # DeepSeek Harness 多用户 Agent 服务。
   #
-  # Dockerfile 会从官方 DSH_TAG 重新 clone 源码；
-  # 不会使用或修改宿主机上的源码 checkout。
+  # Dockerfile 直接把构建上下文里的本地上游源码 COPY 进镜像，构建阶段不再
+  # git clone GitHub，因此网络受限环境下也能构建成功。
+  # 源码目录使用相对路径（见 DSH_SRC_DIR），迁移到新机器时只需把官方原始
+  # 下载的源码放到同一相对路径下即可。
   # 容器内 Nginx 监听 3080，用户首次认证时 provisioner 才会为其启动
   # 一个只监听 127.0.0.1 的 DSH 进程和独立 workspace。
   deepseek-harness:
     build:
       context: ./deepseek-harness
       dockerfile: Dockerfile
+      # 构建期仍使用宿主机网络栈：源码已改为本地 COPY，但 pnpm 依赖下载仍然
+      # 需要出网。docker 默认给 build 容器单独分配 DNS / 路由 / MTU，可能和宿主机
+      # 出网路径不一致 —— 典型症状是宿主机直接跑 pnpm install 成功，但
+      # docker build 里同一批依赖反复 `error (23)`（响应写入失败或代理中断）。
+      # network: host 让 build 和宿主机完全同一条网络路径（含 127.0.0.1 上的
+      # mihomo/公司代理），从而消除这类差异。
+      network: host
       args:
-        DSH_REPO: ${DSH_REPO:-https://github.com/deepseek-ai/deepseek-harness.git}
-        DSH_TAG: ${DSH_TAG:-dsh-v0.1.5-rc.2}
+        # 本地上游源码目录（相对构建上下文 ./deepseek-harness）。
+        DSH_SRC_DIR: ${DSH_SRC_DIR:-deepseek-harness-dsh-v0.1.5-rc.2-git}
+        # 该目录对应官方 tag 的 commit，用于补齐构建元数据（源码没有 .git）。
+        DSH_COMMIT_HASH: ${DSH_COMMIT_HASH:-fb2c4b9e698e30edb738bca4cf0618587db7d203}
+        # 构建镜像时 pnpm/corepack 下载依赖使用的 registry。
+        # 默认国内镜像；若服务器能直连 npmjs 或使用私有源，可在这里覆盖。
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        # pnpm 并发下载连接数。默认 16 在国内网络下容易触发代理/存储层问题
+        # （日志里表现为 error (23)），默认降到 4；仍失败时可改成 1。
+        NPM_FETCH_CONCURRENCY: ${NPM_FETCH_CONCURRENCY:-4}
+        # 可选的构建期代理。仅在 network: host 仍不能出网时用。
+        # 代理地址必须从构建容器视角可达；配合 network: host 时可直接写
+        # http://127.0.0.1:7890（宿主机上的 mihomo）。
+        HTTP_PROXY: ${DSH_BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DSH_BUILD_HTTPS_PROXY:-}
+        NO_PROXY: "${DSH_BUILD_NO_PROXY:-localhost,127.0.0.1,::1}"
+        # APT 镜像源（可选）。留空使用基础镜像自带的 Debian 源。
+        APT_MIRROR: ${DSH_APT_MIRROR:-}
+        APT_SECURITY_MIRROR: ${DSH_APT_SECURITY_MIRROR:-}
     restart: unless-stopped
     depends_on:
       litellm:
+        condition: service_started
+      # DSH 经 compose 网络直连 searxng-mcp:8090 提供联网搜索工具；
+      # 等服务起来即可，真正的连通性由 dsh 进程内的 MCP 客户端处理。
+      searxng-mcp:
         condition: service_started
     expose:
       - "3080"
@@ -296,10 +330,36 @@ services:
       # 不在容器级注入模型密钥：每个用户在网页的“设置 → 模型”里保存自己的
       # LiteLLM virtual key，落到各自独立的 DSH_HOME/.credentials.yaml。
       DSH_DEFAULT_MODEL_IDS: ${DSH_DEFAULT_MODEL_IDS:-deepseek-v4.1-flash,glm-5.3-flash,qwen3-5-397b}
+      # 认证资料卷（htpasswd + 用户 UID 映射）。刻意与 dsh_data 分开：
+      # 用户数据卷单独备份/移交时不应带走密码摘要；容器内 agent 也读不到它。
+      DSH_AUTH_DIR: /etc/dsh-auth
+      # 每用户专属 UID 的分配区间与隔离开关；改这两个值会影响已有文件的归属，
+      # 没有 UID 冲突时保持默认即可。DSH_ISOLATE_USERS=0 会退回「所有用户共用
+      # 一个 root 进程」的旧行为，仅用于排障，此时用户目录之间没有文件隔离。
+      DSH_BASE_UID: ${DSH_BASE_UID:-20000}
+      DSH_UID_CEILING: ${DSH_UID_CEILING:-60000}
+      DSH_ISOLATE_USERS: ${DSH_ISOLATE_USERS:-1}
+      # 沙箱后端。Linux 下 DSH 的沙箱链是 bwrap → landlock，默认
+      # `workspace-write`：命令在文件系统沙箱内跑，越界操作要人工审批。
+      # 两者在本部署的目标宿主上都探测为不可用（详见 README §9.5）：
+      #   - bwrap 需要 user namespace，Docker 默认 seccomp 会拦 CLONE_NEWUSER；
+      #   - landlock 需要内核 ≥5.13，而 AlmaLinux/CentOS/RHEL 8 是 4.18。
+      # 探测失败时 DSH 无法沙箱化任何命令，于是**每次工具调用都要审批**。
+      # 设为 danger-full-access 会关掉审批（文件沙箱同时关闭，但 §3.3 的每用户
+      # UID 隔离不受影响）；宿主内核 ≥5.13 且启用 Landlock 时保持默认即可。
+      DSH_PERMISSION_MODE: ${DSH_PERMISSION_MODE:-workspace-write}
+      # 内置 web_search 只认 DEEPSEEK_API_KEY（本部署不导出），改由项目的
+      # searxng-mcp 提供联网搜索。这个 token 由 home 补丁里的 !!js 读入，
+      # 属于服务端内部凭据，不是每个用户自己的模型 key。
+      MCP_SEARXNG_TOKEN: ${MCP_SEARXNG_TOKEN:?请在 .env 里设置 MCP_SEARXNG_TOKEN}
+      # 私有网关模型的思考强度线协议（compat.thinkingFormat）。默认 openai；
+      # 若 LiteLLM 上游按 DeepSeek 风格处理 reasoning，可改为 deepseek。
+      DSH_MODEL_REASONING_FORMAT: ${DSH_MODEL_REASONING_FORMAT:-openai}
       TZ: Asia/Shanghai
     volumes:
       - dsh_data:/data
       - dsh_workspaces:/workspaces
+      - dsh_auth:/etc/dsh-auth
     security_opt:
       - no-new-privileges:true
     pids_limit: 1024
@@ -359,4 +419,6 @@ volumes:
   cliproxy_logs:
   cliproxy_plugins:
   dsh_data:
+  # 认证资料（htpasswd + UID 映射）单独一卷：与用户数据分离，容器内 agent 无读权限。
+  dsh_auth:
   dsh_workspaces:

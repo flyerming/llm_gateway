@@ -1,0 +1,38 @@
+# DSH home-level user patch layer.
+#
+# 这份文件由 provision.py 复制到每个用户的 `$DSH_HOME/cordis.patch.yml`
+# （即 `/data/users/<user>/.dsh/cordis.patch.yml`）。DSH 的 compose 顺序是
+# bundle → profile → home 补丁 → --patch overlay，所以这一层优先级高于官方
+# bundle，用来做「部署级」的两处覆盖，且完全不改动官方源码。
+#
+# 语义提醒：`- id: X` + 其他键表示**整块替换** X 的 `config`（不是深合并），
+# 所以下面凡是覆盖 `config` 的行都必须把该 row 用到的所有键重新写全。
+
+# 1) 关掉 DSH 内置的 web_search。
+#    官方 base bundle 把 `web.searchProvider` 指到 `deepseek-official`，
+#    那个 provider 只认环境变量 DEEPSEEK_API_KEY；本部署不会导出它，于是
+#    「联网搜索」一调用就报缺少 key。这里把 searchProvider 指向一个**未注册**
+#    的 id，让内置 web_search 在调用时确定性地失败（WEB_PROVIDER_CONFIGURED_MISSING），
+#    而不是隐式选中某个 provider；模型收到明确错误后会改用下面的 MCP 搜索工具。
+#    fetchProvider 仍指向内置的 http provider：web_fetch 不需要任何 key，保留可用。
+- id: web
+  config:
+    searchProvider: none
+    fetchProvider: http
+
+# 2) 通过 MCP 接上项目自带的 searxng-mcp（compose 服务名 `searxng-mcp:8090`），
+#    让模型获得 mcp__searxng__searxng_web_search / mcp__searxng__web_url_read /
+#    mcp__searxng__searxng_instance_info 等工具。工具名是 mcp-client 统一生成的
+#    `mcp__<serverName>__<rawName>`，本部署 serverName 是 searxng。
+#    Token 由 provision.py 通过用户进程环境变量 MCP_SEARXNG_TOKEN 注入，
+#    这里用 !!js 在 Loader 求值时拼进 Authorization 头；token 不会写进本文件。
+- insert:
+    - id: mcp-searxng
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: searxng
+        transport: streamable-http
+        url: http://searxng-mcp:8090/mcp
+        headers:
+          Authorization: !!js '`Bearer ${process.env.MCP_SEARXNG_TOKEN}`'
+        failOnStartupError: false
