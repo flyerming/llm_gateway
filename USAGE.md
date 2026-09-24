@@ -2,6 +2,9 @@
 
 > 面向部署和日常运维本工程的人。设计原理见 [ARCHITECTURE.md](ARCHITECTURE.md)，
 > 已知问题与改进建议见 [REVIEW.md](REVIEW.md)。
+>
+> 如果只需要「CLIProxyAPI + mihomo + DeepSeek Harness」，不启动 LiteLLM、
+> Postgres 和 SearXNG，请看 [LIGHT_DEPLOY.md](LIGHT_DEPLOY.md)。
 
 ---
 

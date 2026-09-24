@@ -5,6 +5,10 @@
 >
 > 本文说明「为什么这么设计」和「各部件如何协作」。日常操作请看 [USAGE.md](USAGE.md)，
 > 已知问题与改进建议请看 [REVIEW.md](REVIEW.md)。
+>
+> 轻量化的「mihomo + CLIProxyAPI + DeepSeek Harness」使用独立的
+> [docker-compose.light.yml](docker-compose.light.yml)，不复用本文件的 LiteLLM、
+> Postgres、SearXNG 服务；具体启动和隔离规则见 [LIGHT_DEPLOY.md](LIGHT_DEPLOY.md)。
 
 ---
 

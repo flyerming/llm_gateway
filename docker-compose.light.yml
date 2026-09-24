@@ -1,0 +1,195 @@
+# 轻量部署：mihomo + CLIProxyAPI + DeepSeek Harness
+#
+# 与全功能 docker-compose.yml 完全隔离：
+#   - 不启动 LiteLLM、Postgres、SearXNG
+#   - DSH 直接调用 cli-proxy-api:8317/v1
+#   - 使用独立的 Compose 项目、网络和命名卷
+#   - 默认端口使用 8788/3081，避免和全功能栈的 8787/4000 冲突
+#
+# 启动：
+#   docker compose -f docker-compose.light.yml up -d --build
+#
+# 需要的 .env 变量：
+#   CLIPROXY_API_KEY
+#   CLIPROXY_MANAGEMENT_KEY
+#   CONSOLE_USER / CONSOLE_PASSWORD
+#   DSH_BOOTSTRAP_USER / DSH_BOOTSTRAP_PASSWORD
+#   DSH_LIGHT_MODEL_IDS（建议填写 CLIProxyAPI /v1/models 返回的模型 ID）
+
+name: ${LIGHT_PROJECT_NAME:-litellm-light}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # mihomo 数据面：CLIProxyAPI 的所有 Codex/OpenAI 上游请求都经这里出网。
+  proxy:
+    image: alpine:3.20
+    restart: unless-stopped
+    volumes:
+      - ./network:/app
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    command:
+      - sh
+      - -c
+      - |
+        chmod +x /app/mihomo-linux-amd64 2>/dev/null || true
+        mkdir -p /app/mihomo/ruleset
+        for f in CustomDirect.list CustomProxy.list; do
+          [ -e "/app/mihomo/ruleset/$$f" ] || : > "/app/mihomo/ruleset/$$f"
+        done
+        exec /app/mihomo-linux-amd64 -d /app/mihomo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:9090/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - light
+    logging: *default-logging
+
+  # 把 Codex OAuth 订阅转换为 OpenAI 兼容 API。
+  # OAuth 凭据持久化在独立的 light volume 中，不与全功能栈混用。
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:v7.3.2}
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_started
+    environment:
+      CLIPROXY_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
+      MANAGEMENT_PASSWORD: ${CLIPROXY_MANAGEMENT_KEY:?请在 .env 里设置 CLIPROXY_MANAGEMENT_KEY}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./cliproxyapi/config.yaml.template:/config/config.yaml.template:ro
+      - ./cliproxyapi/entrypoint.sh:/usr/local/bin/cliproxy-entrypoint.sh:ro
+      - light_cliproxy_auths:/root/.cli-proxy-api
+      - light_cliproxy_logs:/CLIProxyAPI/logs
+      - light_cliproxy_plugins:/CLIProxyAPI/plugins
+    expose:
+      - "8317"
+    command: ["/bin/sh", "/usr/local/bin/cliproxy-entrypoint.sh"]
+    networks:
+      - light
+    logging: *default-logging
+
+  # 轻量栈仍保留运维控制台：它负责 Codex OAuth 登录、OAuth 回调兜底、
+  # mihomo 节点切换/测速/订阅刷新。它不依赖 LiteLLM。
+  proxy-console:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_started
+      cli-proxy-api:
+        condition: service_started
+    volumes:
+      - ./network:/app:ro
+      - ./network/mihomo/ruleset:/ruleset
+    environment:
+      CONSOLE_LISTEN: 0.0.0.0:8787
+      CONSOLE_USER: ${CONSOLE_USER:-admin}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:?请在 .env 里设置 CONSOLE_PASSWORD}
+      MIHOMO_CONTROLLER_URL: http://proxy:9090
+      MIHOMO_SELECTOR: "🚀 节点选择"
+      RULESET_DIR: /ruleset
+      MIHOMO_CONFIG_PATH: /app/mihomo/config.yaml
+      CLIPROXY_MANAGEMENT_URL: http://cli-proxy-api:8317/v0/management
+      CLIPROXY_MANAGEMENT_KEY: ${CLIPROXY_MANAGEMENT_KEY:?请在 .env 里设置 CLIPROXY_MANAGEMENT_KEY}
+      CLIPROXY_BASE_URL: http://cli-proxy-api:8317/v1
+      CLIPROXY_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
+    ports:
+      - "${LIGHT_CONSOLE_PORT:-8788}:8787"
+    command: ["python", "/app/proxy-console.py"]
+    networks:
+      - light
+    logging: *default-logging
+
+  # 多用户 DeepSeek Harness。
+  #
+  # 构建方式与全功能栈一致：构建上下文中需要存在本地 DSH 上游源码 checkout。
+  # 运行期通过 settings.light.yaml 把模型 API 直接指向 CLIProxyAPI，
+  # 不经过 LiteLLM。
+  deepseek-harness:
+    build:
+      context: ./deepseek-harness
+      dockerfile: Dockerfile
+      network: host
+      args:
+        DSH_SRC_DIR: ${DSH_SRC_DIR:-deepseek-harness-dsh-v0.1.5-rc.2-git}
+        DSH_COMMIT_HASH: ${DSH_COMMIT_HASH:-fb2c4b9e698e30edb738bca4cf0618587db7d203}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        NPM_FETCH_CONCURRENCY: ${NPM_FETCH_CONCURRENCY:-4}
+        HTTP_PROXY: ${DSH_BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DSH_BUILD_HTTPS_PROXY:-}
+        NO_PROXY: "${DSH_BUILD_NO_PROXY:-localhost,127.0.0.1,::1}"
+        APT_MIRROR: ${DSH_APT_MIRROR:-}
+        APT_SECURITY_MIRROR: ${DSH_APT_SECURITY_MIRROR:-}
+    restart: unless-stopped
+    depends_on:
+      cli-proxy-api:
+        condition: service_started
+    expose:
+      - "3080"
+    environment:
+      DSH_BOOTSTRAP_USER: ${DSH_BOOTSTRAP_USER:-admin}
+      DSH_BOOTSTRAP_PASSWORD: ${DSH_BOOTSTRAP_PASSWORD:?请在 .env 里设置 DSH_BOOTSTRAP_PASSWORD}
+      # 未设置时只是为了让服务能先启动完成 OAuth/节点配置；正式对话前必须
+      # 改成 CLIProxyAPI /v1/models 返回的真实模型 ID。
+      DSH_DEFAULT_MODEL_IDS: ${DSH_LIGHT_MODEL_IDS:-__SET_AFTER_CLIPROXY_LOGIN__}
+      # 轻量栈只有一把 CLIProxyAPI 数据面 key。它是只读环境凭据，
+      # DSH 模型请求会自动使用它，首次打开 Harness 不需要再手填。
+      DSH_MODEL_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
+      DSH_AUTH_DIR: /etc/dsh-auth
+      DSH_BASE_UID: ${DSH_BASE_UID:-20000}
+      DSH_UID_CEILING: ${DSH_UID_CEILING:-60000}
+      DSH_ISOLATE_USERS: ${DSH_ISOLATE_USERS:-1}
+      DSH_PERMISSION_MODE: ${DSH_PERMISSION_MODE:-workspace-write}
+      DSH_MODEL_REASONING_FORMAT: ${DSH_MODEL_REASONING_FORMAT:-openai}
+      DSH_HOME_PATCH_FILE: /etc/dsh/cordis.patch.light.yml
+      TZ: Asia/Shanghai
+    volumes:
+      - light_dsh_data:/data
+      - light_dsh_workspaces:/workspaces
+      - light_dsh_auth:/etc/dsh-auth
+      # 覆盖镜像中面向 LiteLLM 的默认模板，直接指向 CLIProxyAPI。
+      - ./deepseek-harness/settings.light.yaml:/etc/dsh/settings.yaml:ro
+      # 轻量栈不启动 SearXNG，使用不带 MCP 的 home patch。
+      - ./deepseek-harness/cordis.patch.light.yml:/etc/dsh/cordis.patch.light.yml:ro
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: 8g
+    ports:
+      - "${LIGHT_DSH_PORT:-3081}:3080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ | grep -qx 401"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - light
+    logging: *default-logging
+
+networks:
+  light:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_network
+
+volumes:
+  light_cliproxy_auths:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_cliproxy_auths
+  light_cliproxy_logs:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_cliproxy_logs
+  light_cliproxy_plugins:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_cliproxy_plugins
+  light_dsh_data:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_dsh_data
+  light_dsh_auth:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_dsh_auth
+  light_dsh_workspaces:
+    name: ${LIGHT_PROJECT_NAME:-litellm-light}_dsh_workspaces

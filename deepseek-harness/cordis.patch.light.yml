@@ -1,0 +1,20 @@
+# DSH_DEPLOY_PATCH_V4
+# Lightweight deployment patch.
+#
+# The light stack does not start SearXNG/MCP. Keep the deployment fixes that
+# are useful for a headless container, but do not register a missing MCP host.
+- id: web
+  config:
+    searchProvider: none
+    fetchProvider: http
+
+- id: settings-controller
+  config:
+    nativeOpen: true
+- id: session-controller
+  config:
+    nativeOpen: false
+
+- insert:
+    - id: workspace-delete-cleanup
+      name: /etc/dsh/workspace-delete-cleanup.mjs

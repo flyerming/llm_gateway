@@ -1,0 +1,19 @@
+# DSH_DEPLOY_SETTINGS_V4
+# Lightweight deployment: call CLIProxyAPI directly, without LiteLLM.
+agent-default-model:
+  provider: "private-gateway"
+  model: "__DSH_DEFAULT_MODEL__"
+llm-pi-ai:
+  providers:
+    private-gateway:
+      displayName: "CLIProxyAPI Codex Gateway"
+      apiKeyEnv: "DSH_MODEL_API_KEY"
+      api: "openai-completions"
+      baseURL: "http://cli-proxy-api:8317/v1"
+      reasoning: "high"
+      defaultContextWindow: 128000
+      defaultMaxTokens: 32768
+      defaultInput:
+        - "text"
+      models:
+__DSH_MODELS__
