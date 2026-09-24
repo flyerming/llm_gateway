@@ -172,7 +172,7 @@ STALE_SETTINGS_MARKER = "agent-default-model:"
 # A versioned comment survives normal settings UI edits and gives migrations a
 # deterministic signature. It also catches the first broken renderer's output
 # even when its old marker text was partially consumed by str.replace.
-SETTINGS_TEMPLATE_MARKER = "# DSH_DEPLOY_SETTINGS_V3"
+SETTINGS_TEMPLATE_MARKER = "# DSH_DEPLOY_SETTINGS_V4"
 
 # 手写模型条目默认「无推理能力」，DSH 就不会渲染思考强度选择器。为每个
 # 私有网关模型补上 `reasoningEfforts`，把私有网关（LiteLLM）支持的思考档位
@@ -180,18 +180,17 @@ SETTINGS_TEMPLATE_MARKER = "# DSH_DEPLOY_SETTINGS_V3"
 # 上游 README 示例用 deepseek。可用 DSH_MODEL_REASONING_FORMAT 环境变量覆盖）。
 #
 # 语义（见官方 `packages/llm/llm-pi-ai/src/catalog.ts` resolveModelReasoning）：
-#   - key = 可选档位（off/minimal/low/medium/high/xhigh/max），value = 发给
+#   - key = 可选档位（off/low/high/max），value = 发给
 #     网关的线值；只有 off 允许留空（null，表示该档不发送任何东西）；
 #   - 至少要声明一个非 off 档位，否则视为配置错误；
 #   - 未声明的档位会被 pin 成 null（即界面上不可选）。
 MODEL_REASONING_FORMAT = os.environ.get("DSH_MODEL_REASONING_FORMAT", "openai").strip() or "openai"
-# 档位 → 线值。minimal 用 "none" 是因为多数 OpenAI 兼容后端不接受 "minimal"。
+# 私有 DeepSeek 路由对齐官方模型的四档选择器。
 MODEL_REASONING_LEVELS: tuple[tuple[str, str | None], ...] = (
     ("off", None),
-    ("minimal", "none"),
     ("low", "low"),
-    ("medium", "medium"),
     ("high", "high"),
+    ("max", "max"),
 )
 
 

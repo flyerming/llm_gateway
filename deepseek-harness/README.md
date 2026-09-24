@@ -402,15 +402,15 @@ LiteLLM master key。
             thinkingFormat: openai     # 由 DSH_MODEL_REASONING_FORMAT 决定
           reasoningEfforts:
             off: null                  # 只有 off 允许留空（该档不发送线值）
-            minimal: none
             low: low
-            medium: medium
             high: high
+            max: max
 ```
 
 规则（见官方 `packages/llm/llm-pi-ai/src/catalog.ts` 的 `resolveModelReasoning`）：
 
-- key 是界面可选的档位（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），
+- 当前私有 DeepSeek 路由对齐官方模型，界面可选档位是
+  `off`/`low`/`high`/`max`；
   value 是实际发给网关的线值；只有 `off` 允许为空（`null`）；
 - 至少要声明一个非 `off` 档位，否则 DSH 视为配置错误；
 - 未声明的档位会被 pin 成「不可选」。因此想少几个档位，去掉对应行即可。
@@ -960,7 +960,7 @@ settings-file: invalid document at /data/users/<user>/.dsh/settings.yaml
 ```
 
 说明命名卷里还留着早期错误模板。当前 provisioner 会识别
-`DSH_DEPLOY_SETTINGS_V3` 版本标记并自动重写；若容器尚未用新镜像启动，可先删除
+`DSH_DEPLOY_SETTINGS_V4` 版本标记并自动重写；若容器尚未用新镜像启动，可先删除
 这一个已经损坏的文件再重启（不会删除会话目录和 workspace）：
 
 ```bash

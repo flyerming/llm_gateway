@@ -1,4 +1,4 @@
-# DSH_DEPLOY_SETTINGS_V3
+# DSH_DEPLOY_SETTINGS_V4
 agent-default-model:
   provider: "private-gateway"
   model: "__DSH_DEFAULT_MODEL__"
@@ -9,6 +9,7 @@ llm-pi-ai:
       apiKeyEnv: "DSH_LITELLM_API_KEY"
       api: "openai-completions"
       baseURL: "http://litellm:4000/v1"
+      reasoning: "high"
       defaultContextWindow: 128000
       defaultMaxTokens: 32768
       defaultInput:
