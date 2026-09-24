@@ -32,9 +32,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./network:/app
-      # Debian/Ubuntu 默认通常是 /etc/ssl/certs/ca-certificates.crt；
-      # RHEL/CentOS/AlmaLinux 请在 .env 设置 HOST_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt。
-      - ${HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
+      # 必须在 .env 中指定宿主机上真实存在的 CA bundle 文件：
+      # Debian/Ubuntu: HOST_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      # RHEL/CentOS/AlmaLinux: HOST_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+      - ${HOST_CA_BUNDLE:?请在 .env 设置 HOST_CA_BUNDLE，并指向宿主机上真实存在的 CA bundle 文件}:/etc/ssl/certs/ca-certificates.crt:ro
     command:
       - sh
       - -c

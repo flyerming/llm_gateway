@@ -284,10 +284,10 @@ Alpine 的 busybox `wget` 参数和 GNU wget 不完全一致。确认 mihomo 日
 ### mihomo TLS/x509 错误
 
 容器现在把宿主机的 CA bundle 映射到容器内标准路径
-`/etc/ssl/certs/ca-certificates.crt`。Debian/Ubuntu 默认通常使用：
+`/etc/ssl/certs/ca-certificates.crt`。`HOST_CA_BUNDLE` 是必填项，必须指向
+宿主机上真实存在的文件。Debian/Ubuntu 通常使用：
 
 ```dotenv
-# .env 可省略，默认值就是这个
 HOST_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ```
 
