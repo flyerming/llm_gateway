@@ -108,6 +108,134 @@ docker compose -f docker-compose.light.yml up -d --build
 docker compose -f docker-compose.light.yml ps
 ```
 
+## 3.1 推荐：在构建机导出 DSH 镜像
+
+### 已有全功能镜像时直接复用
+
+如果全功能 `docker-compose.yml` 之前已经成功构建过 DSH，通常可以直接复用类似下面
+的镜像：
+
+```text
+litellm-0914-deploy-deepseek-harness:latest
+```
+
+在轻量栈使用同一个镜像不会和全功能栈冲突。Docker 镜像本身是只读的，两个 Compose
+项目可以同时用它启动不同容器；轻量栈仍然使用自己独立的网络、卷和端口。
+
+在轻量栈 `.env` 中设置：
+
+```dotenv
+DSH_IMAGE=litellm-0914-deploy-deepseek-harness:latest
+```
+
+然后确认镜像存在：
+
+```bash
+docker image inspect litellm-0914-deploy-deepseek-harness:latest
+```
+
+直接启动，不要重新构建：
+
+```bash
+docker compose -f docker-compose.light.yml up -d --no-build
+```
+
+轻量 Compose 会通过下面两个挂载覆盖镜像中面向全功能栈的默认配置：
+
+```text
+./deepseek-harness/settings.light.yaml
+  → /etc/dsh/settings.yaml
+
+./deepseek-harness/cordis.patch.light.yml
+  → /etc/dsh/cordis.patch.light.yml
+```
+
+所以同一个 DSH 镜像可以分别用于：
+
+- 全功能栈：DSH → LiteLLM；
+- 轻量栈：DSH → CLIProxyAPI。
+
+但要确认这个全功能镜像已经包含当前版本的 `deepseek-harness/Dockerfile`、
+`provision.py` 和启动脚本改动。如果镜像很旧，或者是近期修改 DSH 封装前构建的，
+建议重新构建并使用新的 tag，避免把旧的运行时修复带到轻量栈。
+
+如果目标服务器只有 2G 内存，或者不希望轻量栈的构建过程影响目标机上已有容器，
+不要在目标服务器执行 `docker compose ... build`。在一台内存更大的 Linux 构建机上，
+直接构建一个独立 tag：
+
+```bash
+export DSH_IMAGE=litellm-light/deepseek-harness:0.1.5-rc.2
+
+docker build \
+  --network=host \
+  --progress=plain \
+  --build-arg DSH_SRC_DIR=deepseek-harness-dsh-v0.1.5-rc.2-git \
+  --build-arg DSH_COMMIT_HASH=fb2c4b9e698e30edb738bca4cf0618587db7d203 \
+  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+  --build-arg NPM_FETCH_CONCURRENCY=4 \
+  -t "$DSH_IMAGE" \
+  -f deepseek-harness/Dockerfile \
+  deepseek-harness
+
+docker image inspect "$DSH_IMAGE" >/dev/null
+docker save -o deepseek-harness-light-v0.1.5-rc.2.tar "$DSH_IMAGE"
+sha256sum deepseek-harness-light-v0.1.5-rc.2.tar
+```
+
+这个过程只创建一个带明确 tag 的镜像，不会启动或重建当前 Compose 中的任何容器。
+如果构建机已有同名 tag，请把 `DSH_IMAGE` 改成带日期或版本后缀的唯一 tag，例如：
+
+```bash
+export DSH_IMAGE=litellm-light/deepseek-harness:2026-09-24
+```
+
+将 tar 文件和轻量部署文件一起复制到目标服务器。目标服务器至少需要：
+
+```text
+docker-compose.light.yml
+.env
+cliproxyapi/
+network/
+deepseek-harness/settings.light.yaml
+deepseek-harness/cordis.patch.light.yml
+deepseek-harness-light-v0.1.5-rc.2.tar
+```
+
+目标服务器导入并启动：
+
+```bash
+docker load -i deepseek-harness-light-v0.1.5-rc.2.tar
+
+# .env 中设置与构建时完全一致的 tag：
+# DSH_IMAGE=litellm-light/deepseek-harness:0.1.5-rc.2
+
+docker compose -f docker-compose.light.yml config
+docker compose -f docker-compose.light.yml up -d --no-build
+```
+
+`--no-build` 很重要：它会强制 Compose 使用已经 `docker load` 的镜像，不在目标机
+重新执行 pnpm/TypeScript 构建。
+
+如果目标服务器完全不能访问镜像仓库，还可以在构建机上把轻量栈的基础镜像一起导出：
+
+```bash
+docker pull alpine:3.20
+docker pull python:3.12-alpine
+docker pull eceasy/cli-proxy-api:v7.3.2
+docker save -o light-images.tar \
+  "$DSH_IMAGE" \
+  alpine:3.20 \
+  python:3.12-alpine \
+  eceasy/cli-proxy-api:v7.3.2
+```
+
+然后目标机执行：
+
+```bash
+docker load -i light-images.tar
+docker compose -f docker-compose.light.yml up -d --no-build
+```
+
 只更新 DSH 镜像：
 
 ```bash

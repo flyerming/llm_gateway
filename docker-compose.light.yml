@@ -115,6 +115,9 @@ services:
   # 运行期通过 settings.light.yaml 把模型 API 直接指向 CLIProxyAPI，
   # 不经过 LiteLLM。
   deepseek-harness:
+    # 允许在构建机上单独 docker build + docker save，目标机 docker load 后
+    # 用 --no-build 启动，避免目标机重新编译 DSH。
+    image: ${DSH_IMAGE:-litellm-light/deepseek-harness:0.1.5-rc.2}
     build:
       context: ./deepseek-harness
       dockerfile: Dockerfile
