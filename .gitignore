@@ -1,6 +1,9 @@
 # 密钥。里面有 LiteLLM 的 master/salt key、Postgres 密码、控制台密码。
 .env
 
+# 镜像文件
+docker_litellm-0914-deploy-deepseek-harness_latest.tar
+
 # mihomo 的运行时缓存。subscription.yaml 含有订阅链接和每个节点的 uuid，
 # cache.db 是运行状态，都不该进仓库。
 network/mihomo/providers/

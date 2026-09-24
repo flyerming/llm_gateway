@@ -283,7 +283,51 @@ Alpine 的 busybox `wget` 参数和 GNU wget 不完全一致。确认 mihomo 日
 
 ### mihomo TLS/x509 错误
 
-当前挂载 `/etc/ssl/certs:/etc/ssl/certs:ro`。如果宿主机是 RHEL/CentOS 系，改为挂载 `/etc/pki:/etc/pki:ro`，然后 `docker compose restart proxy cli-proxy-api`。
+容器现在把宿主机的 CA bundle 映射到容器内标准路径
+`/etc/ssl/certs/ca-certificates.crt`。Debian/Ubuntu 默认通常使用：
+
+```dotenv
+# .env 可省略，默认值就是这个
+HOST_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+```
+
+如果宿主机是 RHEL/CentOS/AlmaLinux，先在宿主机确认 bundle 的真实路径：
+
+```bash
+readlink -f /etc/pki/tls/certs/ca-bundle.crt
+```
+
+然后在 `.env` 设置：
+
+```dotenv
+HOST_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+```
+
+修改 CA 路径后必须重新创建 `proxy` 容器：
+
+```bash
+docker compose up -d --force-recreate proxy
+```
+
+先分别验证宿主机和容器的 TLS：
+
+```bash
+# 宿主机：根路径没有订阅 token，返回 403 也可以；重点是不能出现证书校验错误
+curl -I https://link.ssrsub.de/
+
+# 容器：只验证 TLS 握手，不访问带 token 的真实订阅 URL
+docker compose exec proxy \
+  wget -S -O /dev/null https://link.ssrsub.de/
+```
+
+判断方式：
+
+- 宿主机失败、容器也失败：服务器 CA、系统时间、出口 HTTPS 中间人或网络本身的问题；
+- 宿主机成功、容器失败：容器 CA bundle 挂载或 `.env` 路径配置问题；
+- 两边 TLS 都成功但真实订阅仍失败：再看订阅 URL、上游返回码和 mihomo 日志。
+
+不要为了绕过这个错误设置 `skip-cert-verify: true`：如果服务器出口被 HTTPS
+中间人代理替换证书，应把企业根 CA 正确加入宿主机 CA bundle，而不是关闭校验。
 
 ### 订阅刷新接口返回 404
 

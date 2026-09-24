@@ -35,8 +35,11 @@ services:
     restart: unless-stopped
     volumes:
       - ./network:/app
-      # Alpine 需要宿主机 CA；RHEL/CentOS 系主机可改为 /etc/pki:/etc/pki:ro。
-      - /etc/ssl/certs:/etc/ssl/certs:ro
+      # 把宿主机 CA bundle 映射到 Alpine/Go 的标准路径。
+      # Debian/Ubuntu 默认通常是 /etc/ssl/certs/ca-certificates.crt；
+      # RHEL/CentOS/AlmaLinux 请在 .env 设置：
+      # HOST_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+      - ${HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     command:
       - sh
       - -c

@@ -3,6 +3,7 @@
 # 与全功能 docker-compose.yml 完全隔离：
 #   - 不启动 LiteLLM、Postgres、SearXNG
 #   - DSH 直接调用 cli-proxy-api:8317/v1
+#   - light-gateway-edge 负责 DSH 远程访问、WebSocket、/api 和 /plugins 路由
 #   - 使用独立的 Compose 项目、网络和命名卷
 #   - 默认端口使用 8788/3081，避免和全功能栈的 8787/4000 冲突
 #
@@ -31,7 +32,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./network:/app
-      - /etc/ssl/certs:/etc/ssl/certs:ro
+      # Debian/Ubuntu 默认通常是 /etc/ssl/certs/ca-certificates.crt；
+      # RHEL/CentOS/AlmaLinux 请在 .env 设置 HOST_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt。
+      - ${HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     command:
       - sh
       - -c
@@ -109,7 +112,8 @@ services:
       - light
     logging: *default-logging
 
-  # 多用户 DeepSeek Harness。
+  # 多用户 DeepSeek Harness。宿主机端口由下面的 light-gateway-edge 发布，
+  # DSH 容器自身只在 compose 网络内暴露 3080。
   #
   # 构建方式与全功能栈一致：构建上下文中需要存在本地 DSH 上游源码 checkout。
   # 运行期通过 settings.light.yaml 把模型 API 直接指向 CLIProxyAPI，
@@ -167,14 +171,35 @@ services:
       - no-new-privileges:true
     pids_limit: 1024
     mem_limit: 8g
-    ports:
-      - "${LIGHT_DSH_PORT:-3081}:3080"
     healthcheck:
       test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ | grep -qx 401"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
+    networks:
+      - light
+    logging: *default-logging
+
+  # 轻量栈专用 DSH 外层入口。
+  # 不能直接把 3080 映射到宿主机：完整远程访问还需要入口层注入
+  # __DSH_TRANSPORT__、转发 WebSocket，并把 /config/ 映射到内部配置编辑器。
+  light-gateway-edge:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      deepseek-harness:
+        condition: service_started
+    ports:
+      - "${LIGHT_DSH_PORT:-3081}:3081"
+    volumes:
+      - ./deepseek-harness/light-gateway-nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     networks:
       - light
     logging: *default-logging

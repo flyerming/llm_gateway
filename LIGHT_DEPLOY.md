@@ -9,6 +9,8 @@ Codex OAuth
 CLIProxyAPI:8317  ──proxy-url──▶  mihomo:7890  ──▶  Codex 上游
     │
     └── OpenAI 兼容 /v1 API ──▶  DeepSeek Harness
+                                      │
+                                      └── light-gateway-edge:3081
 ```
 
 它不启动全功能栈中的 LiteLLM、Postgres、SearXNG 和统一网关。为了让
@@ -28,7 +30,7 @@ docker-compose.light.yml
 - Compose 项目名：`litellm-light`；
 - 独立 Docker 网络：`litellm-light_network`；
 - 独立卷：`litellm-light_cliproxy_auths`、`litellm-light_dsh_data` 等；
-- 默认端口：`8788`（控制台）、`3081`（DeepSeek Harness）。
+- 默认端口：`8788`（控制台）、`3081`（DeepSeek Harness 外层入口）。
 
 因此可以在全功能栈仍运行时启动轻量栈。若你希望复用全功能栈使用的
 `8787/3080` 端口，先停止全功能栈，或者通过 `.env` 覆盖：
@@ -245,7 +247,8 @@ docker compose -f docker-compose.light.yml up -d --build --force-recreate deepse
 查看日志：
 
 ```bash
-docker compose -f docker-compose.light.yml logs -f proxy cli-proxy-api proxy-console deepseek-harness
+docker compose -f docker-compose.light.yml logs -f \
+  proxy cli-proxy-api proxy-console deepseek-harness light-gateway-edge
 ```
 
 停止轻量栈：

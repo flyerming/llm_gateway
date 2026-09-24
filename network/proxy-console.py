@@ -1508,10 +1508,27 @@ function codexLabel(f) {
   return f.email || f.name || f.provider || f.type || 'unknown';
 }
 
+function subscriptionExpired(value) {
+  if (!value) return false;
+  const raw = String(value).trim();
+  // CLIProxyAPI commonly exposes chatgpt_subscription_active_until as a
+  // date-only value (YYYY-MM-DD). Date.parse("YYYY-MM-DD") means midnight
+  // at the start of that date, which incorrectly marks an account expired
+  // during the rest of its final subscription day. Treat date-only values
+  // as valid through the end of the displayed local day.
+  if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(raw)) {
+    const [year, month, day] = raw.split('-').map(Number);
+    const nextLocalDay = new Date(year, month - 1, day + 1);
+    return nextLocalDay.getTime() <= Date.now();
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) && parsed < Date.now();
+}
+
 function codexHealth(f) {
   // 管理面快照与本次自检独立；保留告警，不用单次成功覆盖所有账号。
   if (f.disabled) return { rank: 4, text: '已禁用', cls: 'd-bad' };
-  if (f.subscription_until && Date.parse(f.subscription_until) < Date.now()) {
+  if (subscriptionExpired(f.subscription_until)) {
     return { rank: 3, text: '订阅过期', cls: 'd-bad' };
   }
   if (f.status === 'error' || f.unavailable) {
