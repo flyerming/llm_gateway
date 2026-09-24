@@ -141,6 +141,9 @@ ENV NODE_ENV=production
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY provision.py /usr/local/bin/dsh-provision.py
 COPY settings.yaml /etc/dsh/settings.yaml
+# The provisioner embeds this deployment-only plugin so the build does not
+# depend on a newly added standalone file being present in an older checkout.
+RUN python3 -c "import importlib.util, pathlib; s=importlib.util.spec_from_file_location('dsh_provision','/usr/local/bin/dsh-provision.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); pathlib.Path('/etc/dsh/workspace-delete-cleanup.mjs').write_text(m.WORKSPACE_DELETE_PLUGIN, encoding='utf-8')"
 # DSH 的 home 级补丁模板是可选的：provision.py 内置同一份兜底内容，避免
 # 迁移环境时漏掉尚未加入 Git 的新文件导致 Dockerfile COPY 直接失败。
 # 若构建上下文里存在 cordis.patch.yml，provision.py 会优先使用它。

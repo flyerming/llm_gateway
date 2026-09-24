@@ -43,6 +43,7 @@ deepseek-harness/
 ├── provision.py                           # 本项目跟踪
 ├── start.sh                               # 本项目跟踪
 ├── settings.yaml                          # 本项目跟踪
+├── workspace-delete-cleanup.mjs            # 本项目跟踪（删除工作区时清理目录）
 ├── cordis.patch.yml                       # 本项目跟踪（home 级补丁模板）
 └── deepseek-harness-dsh-v0.1.5-rc.2-git/  # 本地 checkout，不提交、不修改
 ```
@@ -229,6 +230,13 @@ Basic Auth 成功后，Nginx 用 `auth_request` 调用 `provision.py`。provisio
 > 刻意的防提权设计），症状是该用户访问时 500、日志报
 > `sets "..." which only the launching environment may set`。删掉
 > `/workspaces/<user>/.env` 即可恢复；只影响该用户自己的实例。
+
+> **删除工作区的部署语义**：官方 DSH 的“删除工作区”默认只删除注册关系，
+> 保留文件夹和会话日志；本部署额外加载 `workspace-delete-cleanup.mjs`，
+> 因此浏览器确认删除后会同步递归删除该工作区目录。清理插件只允许删除当前
+> 用户 HOME 或 `/workspaces/<user>` 下的子目录，并拒绝用户根目录、`.dsh`、
+> `tmp` 等保留路径。删除失败会写入 Harness 日志，不会伪装成删除成功后再越权
+> 删除其他路径；请在点击确认前把需要保留的文件移出工作区。
 
 ### 3.3 隔离边界
 
@@ -987,6 +995,44 @@ docker compose exec deepseek-harness sh -c \
   'chown -R --no-dereference 20000:20000 /data/users/mengweiming /workspaces/mengweiming'
 docker compose restart deepseek-harness
 ```
+
+Docker 里的 Harness 没有桌面环境，不能让容器直接调用宿主机编辑器。当前部署保留
+“打开配置文件”按钮，但由网关注入的浏览器脚本把它改为打开：
+
+```text
+/deepseek-harness/config/
+```
+
+这是当前 Basic Auth 用户自己的浏览器内 YAML 编辑器。需要直接查看当前用户实际
+配置时，也可以在服务器执行：
+
+```bash
+docker compose exec deepseek-harness sh -c \
+  'sed -n "/llm-pi-ai:/,$p" /data/users/<user>/.dsh/settings.yaml'
+```
+
+也可以直接访问：
+
+```text
+http://<host>:4000/deepseek-harness/config/
+```
+
+编辑器只允许当前 Basic Auth 用户读取和写入自己的 `settings.yaml`。保存前使用
+DSH 自带 YAML 解析器校验，并通过 ETag 防止覆盖其他标签页刚保存的版本；保存前
+保留 `settings.yaml.bak`。实际模型 API key 位于独立的 `.credentials.yaml`，
+不会由这个页面读取或返回。
+
+编辑器保存前会做 YAML 语法校验、ETag 并发检查，并在原文件旁保留
+`settings.yaml.bak`；API key 不在 settings.yaml 中，不会被页面展示。
+
+如果选择器里显示的是自定义 provider（例如 `model-gateway`），要重点确认该
+provider 的每个模型条目下是否有 `reasoningEfforts`；部署模板对
+`private-gateway` 生成的档位不会自动附加到另一个自定义 provider。
+
+当前部署插件还会监听 `llm-pi-ai` 的网页配置更新：对自定义 provider 中没有显式
+关闭 reasoning 的模型，自动补齐 `off`/`low`/`high`/`max` 四档和
+`compat.supportsReasoningEffort`。因此重新配置 `model-test` 后无需手工编辑 YAML；
+更新后刷新页面或新建会话即可看到推理等级。
 
 ### 9.2 认证后仍然 404 / 401：DSH 的浏览器会话 cookie
 

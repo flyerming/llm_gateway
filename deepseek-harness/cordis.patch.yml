@@ -1,3 +1,4 @@
+# DSH_DEPLOY_PATCH_V4
 # DSH home-level user patch layer.
 #
 # 这份文件由 provision.py 复制到每个用户的 `$DSH_HOME/cordis.patch.yml`
@@ -20,6 +21,15 @@
     searchProvider: none
     fetchProvider: http
 
+# The container has no desktop session. Keep the settings/workspace actions
+# path-based instead of offering xdg-open, which can only fail in headless Linux.
+- id: settings-controller
+  config:
+    nativeOpen: true
+- id: session-controller
+  config:
+    nativeOpen: false
+
 # 2) 通过 MCP 接上项目自带的 searxng-mcp（compose 服务名 `searxng-mcp:8090`），
 #    让模型获得 mcp__searxng__searxng_web_search / mcp__searxng__web_url_read /
 #    mcp__searxng__searxng_instance_info 等工具。工具名是 mcp-client 统一生成的
@@ -27,6 +37,8 @@
 #    Token 由 provision.py 通过用户进程环境变量 MCP_SEARXNG_TOKEN 注入，
 #    这里用 !!js 在 Loader 求值时拼进 Authorization 头；token 不会写进本文件。
 - insert:
+    - id: workspace-delete-cleanup
+      name: /etc/dsh/workspace-delete-cleanup.mjs
     - id: mcp-searxng
       name: '@deepseek-ai/dsh-mcp-client'
       config:

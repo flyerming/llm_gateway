@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import http.client
+import json
 import os
 import re
 import shutil
@@ -17,6 +19,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO
+from urllib.parse import urlsplit
 
 
 # The username arrives from Nginx (`$remote_user`, i.e. the Basic Auth handle)
@@ -26,6 +29,43 @@ from typing import BinaryIO
 # `.`, `..` and dotfiles can never be requested (`/data/users/..` would
 # otherwise resolve to `/data` and escape the user's own tree).
 USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+CONFIG_MAX_BYTES = 2 * 1024 * 1024
+YAML_VALIDATE_SCRIPT = """\
+import { parseDocument } from 'yaml'
+let text = ''
+for await (const chunk of process.stdin) text += chunk
+const document = parseDocument(text, { prettyErrors: false })
+if (document.errors.length > 0) {
+  console.error(document.errors.map(error => error.message).join('; '))
+  process.exitCode = 1
+} else if (document.toJS() === null || typeof document.toJS() !== 'object' || Array.isArray(document.toJS())) {
+  console.error('settings document root must be a mapping')
+  process.exitCode = 1
+}
+"""
+CONFIG_EDITOR_HTML = """\
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH 配置文件</title>
+<style>
+body{margin:0;background:#18181b;color:#f4f4f5;font:14px system-ui,sans-serif}
+header{padding:16px 20px;border-bottom:1px solid #3f3f46;display:flex;gap:10px;align-items:center}
+h1{font-size:17px;margin:0 12px 0 0}button{background:#27272a;color:#fff;border:1px solid #52525b;border-radius:6px;padding:7px 14px;cursor:pointer}button:hover{background:#3f3f46}
+#status{margin-left:auto;color:#a1a1aa}.ok{color:#86efac}.err{color:#fca5a5}
+main{padding:14px 20px}textarea{box-sizing:border-box;width:100%;height:calc(100vh - 110px);resize:vertical;background:#09090b;color:#e4e4e7;border:1px solid #52525b;border-radius:8px;padding:14px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace;line-height:1.5;tab-size:2}
+</style>
+<header><h1>Harness 配置文件</h1><button id="reload">重新加载</button><button id="save">保存配置</button><a href="/deepseek-harness/" style="color:#a1a1aa">返回 Harness</a><span id="status">加载中…</span></header>
+<main><textarea id="editor" spellcheck="false"></textarea></main>
+<script>
+const editor=document.getElementById('editor'),status=document.getElementById('status');let etag='';
+function state(text,good=false){status.textContent=text;status.className=good?'ok':'err'}
+async function load(){try{const r=await fetch('./raw',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());editor.value=await r.text();etag=r.headers.get('ETag')||'';state('已加载',true)}catch(e){state('加载失败：'+e.message)}}
+async function save(){try{const r=await fetch('./raw',{method:'PUT',headers:{'Content-Type':'text/plain;charset=utf-8',...(etag?{'If-Match':etag}:{})},body:editor.value});if(r.status===409){throw new Error('配置已被其他操作修改，请重新加载')}if(!r.ok)throw new Error(await r.text());etag=r.headers.get('ETag')||etag;state('已保存，DSH 会自动重新加载',true)}catch(e){state('保存失败：'+e.message)}}
+document.getElementById('reload').onclick=load;document.getElementById('save').onclick=save;load();
+</script>
+"""
 # `dsh web` prints exactly one authenticated URL line per process:
 #   dsh web: http://127.0.0.1:31003/?token=<base64url> (LAN: ...)
 # That token is the only way to mint DSH's browser-session cookie, and DSH only
@@ -107,12 +147,21 @@ HOME_PATCH = Path(os.environ.get("DSH_HOME_PATCH_FILE", "/etc/dsh/cordis.patch.y
 # When the file exists in the image, it remains the source of truth and can be
 # changed without editing this provisioner.
 DEFAULT_HOME_PATCH = """\
+# DSH_DEPLOY_PATCH_V4
 # DSH home-level deployment patch.
 - id: web
   config:
     searchProvider: none
     fetchProvider: http
+- id: settings-controller
+  config:
+    nativeOpen: true
+- id: session-controller
+  config:
+    nativeOpen: false
 - insert:
+    - id: workspace-delete-cleanup
+      name: /etc/dsh/workspace-delete-cleanup.mjs
     - id: mcp-searxng
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -123,10 +172,107 @@ DEFAULT_HOME_PATCH = """\
           Authorization: !!js '`Bearer ${process.env.MCP_SEARXNG_TOKEN}`'
         failOnStartupError: false
 """
-# 判断用户目录里的补丁是否已是当前版本：模板里的 `mcp-searxng` row id 只在
-# 真正接入 MCP 时出现（注释里写的是 `searxng-mcp`，不会误命中）。缺这个特征串
-# 就说明是旧版本（或用户删改坏了），用模板覆盖重写。
-PATCH_MARKER = "mcp-searxng"
+# 判断用户目录里的补丁是否已是当前版本。缺版本标记就说明是旧版本
+# （或用户删改坏了），用模板覆盖重写。
+PATCH_MARKER = "DSH_DEPLOY_PATCH_V4"
+
+# The cleanup plugin is embedded as a build fallback so migrating a working
+# tree that omitted the new standalone .mjs file cannot silently lose the
+# browser-delete behavior. The repository file remains the readable source
+# version; Dockerfile materializes this content at /etc/dsh.
+WORKSPACE_DELETE_PLUGIN = r"""
+import { rm } from 'node:fs/promises'
+import { basename, dirname, relative, resolve } from 'node:path'
+
+export const name = 'workspace-delete-cleanup'
+export const inject = ['workspaceRegistry', 'settings']
+
+const reserved = new Set(['.dsh', 'tmp'])
+const reasoningEfforts = { off: null, low: 'low', high: 'high', max: 'max' }
+
+function userRoots() {
+  const home = resolve(process.env.HOME || '')
+  const cwd = resolve(process.cwd())
+  return [home, cwd]
+}
+
+function deletablePath(path) {
+  const target = resolve(path)
+  for (const root of userRoots()) {
+    const rel = relative(root, target)
+    if (rel === '' || rel.startsWith('../') || rel.startsWith('..' + '/') || rel.includes('\0')) continue
+    if (rel.split(/[\\/]/).some(part => reserved.has(part))) continue
+    if (reserved.has(basename(target))) continue
+    return target
+  }
+  return undefined
+}
+
+function normalizePrivateModels(value) {
+  if (value === null || typeof value !== 'object' || value.providers === undefined) return undefined
+  const providers = value.providers
+  if (providers === null || typeof providers !== 'object') return undefined
+  let changed = false
+  const nextProviders = { ...providers }
+  for (const [providerId, provider] of Object.entries(providers)) {
+    if (provider === null || typeof provider !== 'object' || !Array.isArray(provider.models)) continue
+    const models = provider.models.map(model => {
+      if (model === null || typeof model !== 'object' || model.reasoningEfforts === false) return model
+      if (model.reasoningEfforts !== undefined) return model
+      const compat = { ...(model.compat ?? {}) }
+      if (compat.supportsReasoningEffort === false) return model
+      compat.supportsReasoningEffort = true
+      compat.thinkingFormat ??= process.env.DSH_MODEL_REASONING_FORMAT || 'openai'
+      changed = true
+      return { ...model, compat, reasoningEfforts: { ...reasoningEfforts } }
+    })
+    if (models.some((model, index) => model !== provider.models[index])) {
+      nextProviders[providerId] = { ...provider, reasoning: provider.reasoning ?? 'high', models }
+    }
+  }
+  return changed ? { ...value, providers: nextProviders } : undefined
+}
+
+export function apply(ctx) {
+  const registry = ctx.workspaceRegistry
+  let normalizing = false
+  const normalizeSettings = async next => {
+    if (normalizing) return
+    const patched = normalizePrivateModels(next)
+    if (patched === undefined) return
+    normalizing = true
+    try {
+      await ctx.settings.update('llm-pi-ai', { providers: patched.providers })
+    } finally {
+      normalizing = false
+    }
+  }
+  ctx.on('settings/updated', (namespace, next) => {
+    if (namespace === 'llm-pi-ai') void normalizeSettings(next)
+  })
+  void normalizeSettings(ctx.settings.get('llm-pi-ai'))
+
+  const originalDelete = registry.delete.bind(registry)
+  registry.delete = async id => {
+    const workspace = registry.get(id)
+    const path = workspace?.path
+    const result = await originalDelete(id)
+    if (!result || path === undefined) return result
+    const target = deletablePath(path)
+    if (target === undefined) {
+      console.warn(`workspace-delete-cleanup: refused path ${JSON.stringify(path)}`)
+      return result
+    }
+    try {
+      await rm(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      console.info(`workspace-delete-cleanup: removed ${target}`)
+    } catch (error) {
+      console.error(`workspace-delete-cleanup: failed to remove ${target}`, error)
+    }
+    return result
+  }
+}
+"""
 
 
 def _yaml_quote(value: str) -> str:
@@ -523,6 +669,77 @@ class Provisioner:
             os.close(fd)
             raise OSError(f"{path} is not a regular file")
         return os.fdopen(fd, "rb")
+
+    def _settings_path(self, raw_user: str) -> tuple[str, int, Path]:
+        """Validate a user and materialize the safe path to their settings file."""
+        user = self._validate_user(raw_user)
+        with self.lock:
+            uid = self._uid_for(user)
+            user_root = self.users / user
+            dsh_home = user_root / ".dsh"
+            self._prepare_dir(user_root, uid, uid)
+            self._prepare_dir(dsh_home, uid, uid)
+            settings = dsh_home / "settings.yaml"
+            self._clear_if_not_regular(settings)
+            if not settings.exists():
+                self._write_user_file(
+                    settings,
+                    uid,
+                    uid,
+                    render_settings(self.template.read_text(encoding="utf-8")),
+                )
+        return user, uid, settings
+
+    @staticmethod
+    def _validate_settings_text(text: str) -> None:
+        """Use DSH's own YAML dependency to reject malformed editor saves."""
+        try:
+            result = subprocess.run(
+                [
+                    DSH_WEB_COMMAND[0],
+                    "--input-type=module",
+                    "--eval",
+                    YAML_VALIDATE_SCRIPT,
+                ],
+                cwd="/opt/dsh/packages/settings/settings-file",
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"无法启动 YAML 校验器: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise ValueError(f"settings.yaml YAML 校验失败: {detail[:1000]}")
+
+    def read_settings(self, raw_user: str) -> tuple[str, str, str]:
+        """Return user, settings text, and a strong ETag for the editor."""
+        user, _uid, path = self._settings_path(raw_user)
+        text = self._read_user_file(path).decode("utf-8")
+        return user, text, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def write_settings(self, raw_user: str, text: str, expected_etag: str | None) -> str:
+        """Validate and atomically replace one user's settings document."""
+        if len(text.encode("utf-8")) > CONFIG_MAX_BYTES:
+            raise ValueError(f"settings.yaml 超过 {CONFIG_MAX_BYTES // 1024 // 1024} MiB 限制")
+        self._validate_settings_text(text)
+        user, uid, path = self._settings_path(raw_user)
+        current = self._read_user_file(path).decode("utf-8") if path.exists() else ""
+        current_etag = hashlib.sha256(current.encode("utf-8")).hexdigest()
+        if expected_etag and expected_etag != current_etag:
+            raise FileExistsError("settings.yaml 已被其他操作修改，请重新加载")
+        backup = path.with_name("settings.yaml.bak")
+        self._write_user_file(backup, uid, uid, current)
+        self._write_user_file(path, uid, uid, text)
+        print(f"provisioner: settings updated for user={user!r}", flush=True)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def config_page(self, raw_user: str) -> bytes:
+        """Render the browser editor without exposing credential files."""
+        self._settings_path(raw_user)
+        return CONFIG_EDITOR_HTML.encode("utf-8")
 
     def _seed_npmrc(self, user_root: Path, uid: int, gid: int) -> None:
         """Copy the build-time `.npmrc` into the user's HOME if it is missing.
@@ -950,7 +1167,85 @@ PROVISIONER = Provisioner()
 class Handler(BaseHTTPRequestHandler):
     server_version = "dsh-provisioner/1"
 
+    def _user(self) -> str:
+        return self.headers.get("X-Remote-User", "")
+
+    def _send_body(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_config_error(self, status: int, exc: Exception) -> None:
+        body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8")
+        self._send_body(status, body, "application/json; charset=utf-8")
+
+    def _handle_config_get(self, path: str) -> None:
+        user = self._user()
+        try:
+            if path == "/config/":
+                self._send_body(200, PROVISIONER.config_page(user), "text/html; charset=utf-8")
+                return
+            if path == "/config/raw":
+                _user, text, etag = PROVISIONER.read_settings(user)
+                body = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/yaml; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_error(404)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"provisioner: config read failed for user={user!r}: {exc}", flush=True)
+            self._send_config_error(500, exc)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = urlsplit(self.path).path
+        if path != "/config/raw":
+            self.send_error(404)
+            return
+        user = self._user()
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_config_error(400, ValueError("invalid Content-Length"))
+            return
+        if length < 0 or length > CONFIG_MAX_BYTES:
+            self._send_config_error(413, ValueError("settings.yaml body is too large"))
+            return
+        try:
+            text = self.rfile.read(length).decode("utf-8")
+            etag = PROVISIONER.write_settings(
+                user,
+                text,
+                self.headers.get("If-Match"),
+            )
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except UnicodeDecodeError as exc:
+            self._send_config_error(400, ValueError("settings.yaml must be UTF-8"))
+        except FileExistsError as exc:
+            self._send_config_error(409, exc)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"provisioner: config write failed for user={user!r}: {exc}", flush=True)
+            self._send_config_error(400, exc)
+
     def do_GET(self) -> None:  # noqa: N802
+        path = urlsplit(self.path).path
+        if path.startswith("/config/"):
+            self._handle_config_get(path)
+            return
         user = self.headers.get("X-Remote-User", "")
         try:
             port = PROVISIONER.ensure(user)
