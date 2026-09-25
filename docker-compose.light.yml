@@ -17,6 +17,10 @@
 #   DSH_BOOTSTRAP_USER / DSH_BOOTSTRAP_PASSWORD
 #   DSH_LIGHT_MODEL_IDS（建议填写 CLIProxyAPI /v1/models 返回的模型 ID）
 
+# Optional HTTPS for light-gateway-edge (disabled by default):
+#   LIGHT_SSL_ENABLED=true
+#   LIGHT_SSL_CERT_PATH=./network/www.mistakenote.cn.pem
+#   LIGHT_SSL_KEY_PATH=./network/www.mistakenote.cn.key
 name: ${LIGHT_PROJECT_NAME:-litellm-light}
 
 x-logging: &default-logging
@@ -194,7 +198,51 @@ services:
     ports:
       - "${LIGHT_DSH_PORT:-3081}:3081"
     volumes:
-      - ./deepseek-harness/light-gateway-nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deepseek-harness/light-gateway-nginx.conf:/etc/nginx/light-gateway-nginx.conf.template:ro
+      - type: bind
+        source: ${LIGHT_SSL_CERT_PATH:-./network/www.mistakenote.cn.pem}
+        target: /etc/nginx/ssl/server.crt
+        read_only: true
+      - type: bind
+        source: ${LIGHT_SSL_KEY_PATH:-./network/www.mistakenote.cn.key}
+        target: /etc/nginx/ssl/server.key
+        read_only: true
+    environment:
+      LIGHT_SSL_ENABLED: "${LIGHT_SSL_ENABLED:-false}"
+      LIGHT_SSL_CERT_FILE: /etc/nginx/ssl/server.crt
+      LIGHT_SSL_KEY_FILE: /etc/nginx/ssl/server.key
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$${LIGHT_SSL_ENABLED:-false}" in
+          1|true|TRUE|yes|YES|on|ON)
+            if [ ! -f "$${LIGHT_SSL_CERT_FILE}" ] || [ ! -r "$${LIGHT_SSL_CERT_FILE}" ]; then
+              echo "LIGHT_SSL_CERT_FILE is missing or unreadable: $${LIGHT_SSL_CERT_FILE}" >&2
+              exit 1
+            fi
+            if [ ! -f "$${LIGHT_SSL_KEY_FILE}" ] || [ ! -r "$${LIGHT_SSL_KEY_FILE}" ]; then
+              echo "LIGHT_SSL_KEY_FILE is missing or unreadable: $${LIGHT_SSL_KEY_FILE}" >&2
+              exit 1
+            fi
+            export LIGHT_SSL_LISTEN_SUFFIX=" ssl"
+            export LIGHT_SSL_DIRECTIVES="ssl_certificate $${LIGHT_SSL_CERT_FILE};
+        ssl_certificate_key $${LIGHT_SSL_KEY_FILE};"
+            ;;
+          0|false|FALSE|no|NO|off|OFF|"")
+            export LIGHT_SSL_LISTEN_SUFFIX=""
+            export LIGHT_SSL_DIRECTIVES=""
+            ;;
+          *)
+            echo "LIGHT_SSL_ENABLED must be true or false" >&2
+            exit 1
+            ;;
+        esac
+        envsubst '$${LIGHT_SSL_LISTEN_SUFFIX} $${LIGHT_SSL_DIRECTIVES}' \
+          < /etc/nginx/light-gateway-nginx.conf.template \
+          > /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
     healthcheck:
       test: ["CMD-SHELL", "nginx -t"]
       interval: 30s
