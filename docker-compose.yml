@@ -242,7 +242,7 @@ services:
 
   # LiteLLM 对外提供统一 API；模型的 base_url/key 指向 cli-proxy-api（见 README）。
   litellm:
-    image: litellm/litellm-database:v1.100.1
+    image: ${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm:1.104.3}
     restart: unless-stopped
     expose:
       - "4000"

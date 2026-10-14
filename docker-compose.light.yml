@@ -107,7 +107,7 @@ services:
       CLIPROXY_BASE_URL: http://cli-proxy-api:8317/v1
       CLIPROXY_API_KEY: ${CLIPROXY_API_KEY:?请在 .env 里设置 CLIPROXY_API_KEY}
     ports:
-      - "${LIGHT_CONSOLE_PORT:-8788}:8787"
+      - "127.0.0.1:${LIGHT_CONSOLE_PORT:-8788}:8787"
     command: ["python", "/app/proxy-console.py"]
     networks:
       - light
