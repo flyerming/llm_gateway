@@ -101,7 +101,8 @@ services:
     environment:
       CONSOLE_LISTEN: 0.0.0.0:8787
       CONSOLE_USER: ${CONSOLE_USER:-admin}
-      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:?请在 .env 里设置 CONSOLE_PASSWORD}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:-}
+      CONSOLE_AUTH_DISABLED: ${CONSOLE_AUTH_DISABLED:-false}
       MIHOMO_CONTROLLER_URL: http://proxy:9090
       MIHOMO_SELECTOR: "🚀 节点选择"
       RULESET_DIR: /ruleset

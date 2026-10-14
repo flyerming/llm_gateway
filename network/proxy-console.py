@@ -51,6 +51,12 @@ CONTROLLER = os.environ.get("MIHOMO_CONTROLLER_URL", "http://127.0.0.1:9090").rs
 LISTEN = os.environ.get("CONSOLE_LISTEN", "127.0.0.1:8787")
 AUTH_USER = os.environ.get("CONSOLE_USER", "admin")
 AUTH_PASSWORD = os.environ.get("CONSOLE_PASSWORD", "")
+AUTH_DISABLED = os.environ.get("CONSOLE_AUTH_DISABLED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 DEFAULT_GROUP = os.environ.get("MIHOMO_SELECTOR", "🚀 节点选择")
 PROVIDER_NAME = os.environ.get("SUBSCRIPTION_PROVIDER", "subscription")
 try:
@@ -2054,6 +2060,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- 鉴权 -------------------------------------------------------------
 
     def _authorized(self):
+        if AUTH_DISABLED:
+            return True
         header = self.headers.get("Authorization") or ""
         if not header.startswith("Basic "):
             return False
@@ -2068,6 +2076,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _require_auth(self):
+        if AUTH_DISABLED:
+            return True
         if self._authorized():
             return True
         # 先把请求体读掉再拒绝。不读就回 401 的话，客户端可能还在写 body，
@@ -2263,7 +2273,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not AUTH_PASSWORD:
+    if not AUTH_DISABLED and not AUTH_PASSWORD:
         print(
             "CONSOLE_PASSWORD 未设置，拒绝以空密码启动。\n"
             "请在 .env 里设置 CONSOLE_PASSWORD 后重试。",
