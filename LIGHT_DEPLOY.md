@@ -95,6 +95,24 @@ docker compose -f docker-compose.light.yml up -d --force-recreate deepseek-harne
 Harness 的“设置 → 模型”中调整；如果要让已有用户重新采用新的默认清单，需要删除
 对应用户的 `settings.yaml` 后重新访问，或者使用内置配置编辑页。
 
+### 可选：启用 HTTPS
+
+`light-gateway-edge` 默认继续使用 HTTP。要在现有 `LIGHT_DSH_PORT` 上启用 HTTPS，
+在项目根目录 `.env` 中配置：
+
+```dotenv
+LIGHT_SSL_ENABLED=true
+LIGHT_SSL_CERT_PATH=./network/www.mistakenote.cn.pem
+LIGHT_SSL_KEY_PATH=./network/www.mistakenote.cn.key
+```
+
+证书和私钥会以只读方式挂载到入口容器；启动时会检查文件是否可读。关闭时设置
+`LIGHT_SSL_ENABLED=false`（或删除该变量），入口恢复为 HTTP。修改后重建入口：
+
+```bash
+docker compose -f docker-compose.light.yml up -d --force-recreate light-gateway-edge
+```
+
 ## 3. 启动和更新
 
 首次启动建议先检查 Compose 渲染结果：
