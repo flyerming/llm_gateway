@@ -13,9 +13,11 @@
 # 需要的 .env 变量：
 #   CLIPROXY_API_KEY
 #   CLIPROXY_MANAGEMENT_KEY
-#   CONSOLE_USER / CONSOLE_PASSWORD
 #   DSH_BOOTSTRAP_USER / DSH_BOOTSTRAP_PASSWORD
 #   DSH_LIGHT_MODEL_IDS（建议填写 CLIProxyAPI /v1/models 返回的模型 ID）
+#
+# 控制台（/console/）与 DSH 共用同一套登录（DSH 的 htpasswd），由
+# light-gateway-edge 统一鉴权，轻量栈不再使用 CONSOLE_USER / CONSOLE_PASSWORD。
 
 # Optional HTTPS for light-gateway-edge (disabled by default):
 #   LIGHT_SSL_ENABLED=true
@@ -100,9 +102,11 @@ services:
       - ./network/mihomo/ruleset:/ruleset
     environment:
       CONSOLE_LISTEN: 0.0.0.0:8787
-      CONSOLE_USER: ${CONSOLE_USER:-admin}
-      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:-}
-      CONSOLE_AUTH_DISABLED: ${CONSOLE_AUTH_DISABLED:-false}
+      # 鉴权交给 light-gateway-edge（与 DSH 同一份 htpasswd）。这里必须关掉：
+      # 网关转发过来的 Authorization 是 DSH 账号，开着的话会拿它去比对
+      # CONSOLE_PASSWORD，导致浏览器在两个 realm 之间反复弹框。
+      # 下面的直连端口只绑 127.0.0.1，仅供宿主机本机或 SSH 隧道使用。
+      CONSOLE_AUTH_DISABLED: "true"
       MIHOMO_CONTROLLER_URL: http://proxy:9090
       MIHOMO_SELECTOR: "🚀 节点选择"
       RULESET_DIR: /ruleset
@@ -200,6 +204,9 @@ services:
       - "${LIGHT_DSH_PORT:-3081}:3081"
     volumes:
       - ./deepseek-harness/light-gateway-nginx.conf:/etc/nginx/light-gateway-nginx.conf.template:ro
+      # /console/ 与控制台 /api 用 DSH 同一份 htpasswd 鉴权。挂整个卷而不是
+      # 单个文件：start.sh 用 mv 替换 htpasswd（换 inode），单文件 bind 会看不到新增用户。
+      - light_dsh_auth:/etc/dsh-auth:ro
       - type: bind
         source: ${LIGHT_SSL_CERT_PATH:-./network/www.mistakenote.cn.pem}
         target: /etc/nginx/ssl/server.crt
@@ -240,6 +247,28 @@ services:
             exit 1
             ;;
         esac
+        # htpasswd 在 DSH 容器里是 0640 root:www-data（Debian gid 33），目录 0750。
+        # 这里的 worker 以 nginx 用户运行，把它加进同 gid 的组才能读到；
+        # nginx 启动 worker 时会 initgroups，按 /etc/group 重新加载附加组。
+        # 首次启动时卷是空的，等 DSH 的 start.sh 写出 htpasswd 再继续。
+        i=0
+        while [ ! -s /etc/dsh-auth/htpasswd ]; do
+          i=$$((i + 1))
+          if [ "$$i" -gt 120 ]; then
+            echo "/etc/dsh-auth/htpasswd not found; is deepseek-harness running?" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        auth_gid="$$(stat -c %g /etc/dsh-auth)"
+        if [ "$$auth_gid" != "0" ]; then
+          auth_group="$$(awk -F: -v g="$$auth_gid" '$$3 == g { print $$1; exit }' /etc/group)"
+          if [ -z "$$auth_group" ]; then
+            auth_group=dshauth
+            addgroup -g "$$auth_gid" "$$auth_group"
+          fi
+          addgroup nginx "$$auth_group" 2>/dev/null || true
+        fi
         envsubst '$${LIGHT_SSL_LISTEN_SUFFIX} $${LIGHT_SSL_DIRECTIVES}' \
           < /etc/nginx/light-gateway-nginx.conf.template \
           > /etc/nginx/nginx.conf

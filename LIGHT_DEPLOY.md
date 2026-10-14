@@ -50,8 +50,6 @@ LIGHT_DSH_PORT=3080
 ```dotenv
 CLIPROXY_API_KEY=请设置数据面密钥
 CLIPROXY_MANAGEMENT_KEY=请设置管理面密钥
-CONSOLE_USER=admin
-CONSOLE_PASSWORD=请设置控制台密码
 DSH_BOOTSTRAP_USER=admin
 DSH_BOOTSTRAP_PASSWORD=请设置 Harness 密码
 ```
@@ -284,10 +282,17 @@ docker compose -f docker-compose.light.yml down
 打开：
 
 ```text
-http://<服务器IP>:8788
+https://<服务器IP>:3081/console/
 ```
 
-用 `CONSOLE_USER/CONSOLE_PASSWORD` 登录，在“ChatGPT/Codex 订阅”面板完成 Codex
+用 DeepSeek Harness 的账号（`DSH_BOOTSTRAP_USER/DSH_BOOTSTRAP_PASSWORD` 或后来加进
+htpasswd 的用户）登录。控制台和 Harness 由 `light-gateway-edge` 用同一份 htpasswd
+鉴权，在任一个页面登录后，另一个不会再弹框。轻量栈不再使用
+`CONSOLE_USER/CONSOLE_PASSWORD`；`127.0.0.1:8788` 直连端口不经过网关、没有鉴权，
+只绑在宿主机本机，仅供本机或 SSH 隧道使用。没开 `LIGHT_SSL_ENABLED` 时把上面的
+`https` 换成 `http`。
+
+在“ChatGPT/Codex 订阅”面板完成 Codex
 OAuth。远程部署遇到回调落到你电脑的 `localhost:1455` 时，复制完整回调 URL，粘贴
 回控制台提交。
 
